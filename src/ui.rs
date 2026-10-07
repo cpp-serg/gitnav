@@ -36,7 +36,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [gutter, list] = Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).areas(list);
 
     app.height = list.height as usize;
+    app.width = frame.area().width as usize;
     app.settle();
+
+    if let Some(pager) = &mut app.pager {
+        // The commit's contents take the whole window above the status line.
+        let area = Rect { x: gutter.x, width: gutter.width + list.width, ..list };
+        pager.clamp(area.height as usize);
+        let shown = Paragraph::new(pager.lines.clone()).scroll((pager.scroll as u16, pager.hscroll as u16));
+        frame.render_widget(shown, area);
+        let last = (pager.scroll + area.height as usize).min(pager.lines.len());
+        let info = format!(" {}  lines {}-{} of {}", pager.title, pager.scroll + 1, last, pager.lines.len());
+        let hint = "q close ";
+        let pad = (status.width as usize).saturating_sub(info.chars().count() + hint.len());
+        let style = Style::new().fg(Color::Black).bg(Color::Gray);
+        frame.render_widget(Line::styled(format!("{info}{}{hint}", " ".repeat(pad)), style), status);
+        return;
+    }
 
     let rows = app.offset..(app.offset + app.height).min(app.len());
     let lines: Vec<Line> = rows.clone().map(|row| commit_line(app, row)).collect();

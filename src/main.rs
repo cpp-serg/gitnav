@@ -1,3 +1,4 @@
+mod ansi;
 mod app;
 mod config;
 mod graph;
@@ -136,6 +137,13 @@ fn run_command(
             }
             reload(app, path, &app.message.clone().unwrap_or_default());
         }
+        Command::Show(oid) => match ops::show(path, oid, app.width) {
+            Ok(text) => {
+                let title = format!("git show {}", &oid.to_string()[..7]);
+                app.pager = Some(app::Pager::new(title, ansi::to_lines(&text)));
+            }
+            Err(e) => app.message = Some(format!("{e:#}")),
+        },
         Command::AbortRebase => {
             app.message = Some(match ops::abort_rebase(path) {
                 Ok(()) => "rebase aborted".into(),

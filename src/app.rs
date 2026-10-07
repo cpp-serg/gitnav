@@ -26,6 +26,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("zz  zt  zb", "put the cursor row at the centre, top, bottom"),
     ("h l  ← →", "scroll sideways"),
     ("0", "scroll back to the left edge"),
+    ("Enter", "show the commit (git show); j k, Ctrl-d Ctrl-u, Space, gg G scroll; q Esc Enter close"),
     ("", "Selecting"),
     ("Space", "mark or unmark the commit, move down"),
     ("v", "start a range; v again marks it"),
@@ -60,6 +61,29 @@ pub const HELP: &[(&str, &str)] = &[
 pub enum Command {
     Pull,
     AbortRebase,
+    /// Show a commit's contents (`git show`).
+    Show(git2::Oid),
+}
+
+/// A scrollable text view over the graph, such as a commit's `git show`.
+pub struct Pager {
+    pub title: String,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub scroll: usize,
+    pub hscroll: usize,
+    /// `g` was pressed: a second `g` goes to the top.
+    pending_g: bool,
+}
+
+impl Pager {
+    pub fn new(title: String, lines: Vec<ratatui::text::Line<'static>>) -> Self {
+        Pager { title, lines, scroll: 0, hscroll: 0, pending_g: false }
+    }
+
+    /// Keeps the scroll position within the text for a view `height` lines tall.
+    pub fn clamp(&mut self, height: usize) {
+        self.scroll = self.scroll.min(self.lines.len().saturating_sub(height.max(1)));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +148,8 @@ pub struct App {
     pub hscroll: usize,
     /// Visible rows, as of the last draw.
     pub height: usize,
+    /// The window's width, as of the last draw.
+    pub width: usize,
     pub marks: BTreeSet<usize>,
     /// Where visual mode started, while it is active.
     pub visual: Option<usize>,
@@ -162,6 +188,8 @@ pub struct App {
     center_cursor: bool,
     /// The help popup's scroll position, while it is open.
     pub help: Option<usize>,
+    /// A commit's contents shown over the graph (Enter).
+    pub pager: Option<Pager>,
     pub quit: bool,
 }
 
@@ -175,6 +203,7 @@ impl App {
             offset: 0,
             hscroll: 0,
             height: 1,
+            width: 80,
             marks: BTreeSet::new(),
             visual: None,
             count: None,
@@ -197,6 +226,7 @@ impl App {
             match_mode: Mode::default(),
             last_query: Default::default(),
             help: None,
+            pager: None,
             quit: false,
         };
         app.relayout();
@@ -306,6 +336,12 @@ impl App {
             {
                 self.command = command;
                 self.dialog = None;
+            }
+            return;
+        }
+        if let Some(mut pager) = self.pager.take() {
+            if self.pager_key(&mut pager, key) {
+                self.pager = Some(pager);
             }
             return;
         }
@@ -449,6 +485,11 @@ impl App {
             (None, KeyCode::Char('R'), false) => self.reload = true,
             (None, KeyCode::Char('@'), false) => self.set_head(),
             (None, KeyCode::Char('p'), false) => self.command = Some(Command::Pull),
+            (None, KeyCode::Enter, false) => {
+                if let Some(c) = self.history.commits.get(self.cursor) {
+                    self.command = Some(Command::Show(c.oid));
+                }
+            }
             (None, KeyCode::Char('?'), false) => self.help = Some(0),
             (None, KeyCode::Char('w'), false) => self.watch = !self.watch,
             (None, KeyCode::Char('^'), false) => {
@@ -475,6 +516,38 @@ impl App {
             _ => {}
         }
         self.clamp();
+    }
+
+    /// A key while the pager is open; false when it closes the pager.
+    fn pager_key(&mut self, p: &mut Pager, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.height.max(1);
+        let g = std::mem::take(&mut p.pending_g);
+        match (key.code, ctrl) {
+            (KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter, false) => return false,
+            (KeyCode::Char('c'), true) => {
+                self.quit = true;
+                return false;
+            }
+            (KeyCode::Char('j') | KeyCode::Down, false) | (KeyCode::Char('e'), true) => p.scroll += 1,
+            (KeyCode::Char('k') | KeyCode::Up, false) | (KeyCode::Char('y'), true) => {
+                p.scroll = p.scroll.saturating_sub(1)
+            }
+            (KeyCode::Char('d'), true) => p.scroll += page / 2,
+            (KeyCode::Char('u'), true) => p.scroll = p.scroll.saturating_sub(page / 2),
+            (KeyCode::Char('f'), true) | (KeyCode::Char(' ') | KeyCode::PageDown, false) => p.scroll += page,
+            (KeyCode::Char('b'), true) | (KeyCode::PageUp, false) => p.scroll = p.scroll.saturating_sub(page),
+            (KeyCode::Char('g'), false) if g => p.scroll = 0,
+            (KeyCode::Char('g'), false) => p.pending_g = true,
+            (KeyCode::Home, false) => p.scroll = 0,
+            (KeyCode::Char('G') | KeyCode::End, false) => p.scroll = usize::MAX,
+            (KeyCode::Char('h') | KeyCode::Left, false) => p.hscroll = p.hscroll.saturating_sub(HSCROLL_STEP),
+            (KeyCode::Char('l') | KeyCode::Right, false) => p.hscroll += HSCROLL_STEP,
+            (KeyCode::Char('0'), false) => p.hscroll = 0,
+            _ => {}
+        }
+        p.clamp(page);
+        true
     }
 
     fn open_prompt(&mut self, kind: PromptKind, input: String) {
@@ -1096,5 +1169,25 @@ mod tests {
         assert_eq!((a.total(), a.head_row), (5, Some(0)));
         keys(&mut a, "a");
         assert_eq!(a.len(), 5);
+    }
+
+    #[test]
+    fn enter_shows_and_the_pager_scrolls() {
+        let mut a = app(20, 10);
+        keys(&mut a, "3G");
+        special(&mut a, KeyCode::Enter);
+        assert_eq!(a.command.take(), Some(Command::Show(a.history.commits[2].oid)));
+
+        let text: Vec<ratatui::text::Line<'static>> = (0..50).map(|i| ratatui::text::Line::raw(format!("line {i}"))).collect();
+        a.pager = Some(Pager::new("show".into(), text));
+        keys(&mut a, "jjj");
+        assert_eq!(a.pager.as_ref().unwrap().scroll, 3);
+        assert_eq!(a.cursor, 2, "the graph does not move under the pager");
+        keys(&mut a, "G");
+        assert_eq!(a.pager.as_ref().unwrap().scroll, 40, "last page");
+        keys(&mut a, "gg");
+        assert_eq!(a.pager.as_ref().unwrap().scroll, 0);
+        keys(&mut a, "q");
+        assert!(a.pager.is_none() && !a.quit);
     }
 }
