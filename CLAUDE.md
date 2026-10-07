@@ -7,8 +7,13 @@ vi-style keys. Commit data comes from libgit2 (`git2`); the graph layout and dra
 
 ## Commands
 
+`.cargo/config.toml` makes `x86_64-unknown-linux-musl` the default target, so every build is a
+fully static binary (libgit2 built from its bundled source, without git2's https/ssh features)
+that runs on any x86_64 Linux. It needs `rustup target add x86_64-unknown-linux-musl` and
+`musl-gcc` (Arch: `pacman -S musl`).
+
 ```sh
-cargo build                          # debug builds only for now; binary: target/debug/gitnav
+cargo build                          # debug builds only for now; binary: target/x86_64-unknown-linux-musl/debug/gitnav
 cargo test                           # all tests
 cargo test graph::tests::octopus     # one test (any substring of the path works)
 cargo clippy --all-targets           # expected to be warning-free

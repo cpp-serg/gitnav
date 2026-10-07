@@ -1,0 +1,5 @@
+# Build a fully static binary (musl libc; libgit2 and zlib built from source) so it runs on
+# any x86_64 Linux. Needs the Rust target (rustup target add x86_64-unknown-linux-musl) and
+# musl-gcc for libgit2's C sources (Arch: pacman -S musl).
+[build]
+target = "x86_64-unknown-linux-musl"
