@@ -867,8 +867,8 @@ fn order_metrics() {
         }
         let breaks = (1..h.commits.len()).filter(|&i| !h.commits[i - 1].parents.contains(&i)).count();
         let rows = crate::graph::layout(h.commits.iter().map(|c| c.parents.as_slice()), &[], &[]);
-        let lanes: usize = rows.iter().map(|r| r.iter().filter(|c| c.glyph != ' ').count()).sum();
-        let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let lanes: usize = rows.iter().map(|r| r.cells.iter().filter(|c| c.glyph != ' ').count()).sum();
+        let widest = rows.iter().flat_map(|r| std::iter::once(&r.cells).chain(&r.below)).map(Vec::len).max().unwrap_or(0);
         println!(
             "{:>8}: {} rows, next row not a parent {} times, lanes per row {:.2}, widest {}",
             order.name(), h.commits.len(), breaks, lanes as f64 / rows.len() as f64, widest

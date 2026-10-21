@@ -1,17 +1,23 @@
-//! Lane layout for the revision graph: one row per commit, drawn with box-drawing glyphs.
+//! Lane layout for the revision graph: one line per commit, and between commits the lines
+//! where the graph's lines change column, drawn with box-drawing glyphs.
 //!
 //! The input is, for each row in display order (children before parents), the row indices of
 //! that commit's parents. Lanes never shift sideways: a lane keeps its column from the row that
 //! opens it to the row that closes it, and freed columns are reused by later lanes.
+//!
+//! As in `git log --graph`, a line changes column only between commits, on connector lines
+//! under the commit above: a step to the next column is one `╲` or `╱` in the gap between the
+//! two, and a longer reach runs along `_` from one diagonal to another, over two connector
+//! lines. A commit's line itself only holds the lanes passing by and the commit's node.
 //!
 //! A spine can be given: a line of rows, each a parent of the one before (the layout head's
 //! line). Those always take the leftmost lane, which nothing else then uses, so that line runs
 //! straight down the left.
 //!
 //! Two rules keep incoming merges next to the line they merge into, as git's graph does:
-//! a line that heads for the same commit as an older line joins it on its own row, freeing its
-//! column; and before a merge, a line sitting in the column right of the merge's commit steps
-//! one column further right, so the merged branch lands next to the target line.
+//! a line that heads for the same commit as an older line joins it under its own row, freeing
+//! its column; and before a merge, a line sitting in the column right of the merge's commit
+//! steps one column further right, so the merged branch lands next to the target line.
 //!
 //! Lines of the head's history (the heavy rows) get the columns next to the spine: a line
 //! outside it is placed right of as many columns as the head's history needs anywhere along
@@ -19,10 +25,11 @@
 //!
 //! Rows can also be marked heavy (the head and everything it reaches): the lines from a heavy
 //! row to its parents are drawn with heavy glyphs. Cells keep the light glyph and say which of
-//! their lines are heavy; `shown` picks the glyph to draw.
+//! their lines are heavy; `shown` picks the glyph to draw. There are no heavy diagonals, so
+//! those are drawn bold instead.
 
-/// One lane column of one row: the glyph in the lane itself, and the character drawn in the
-/// gap to its right (a space, or `─` when a horizontal run passes through).
+/// One lane column of one line: the glyph in the lane itself, and the character drawn in the
+/// gap to its right (a space, a diagonal, or `_` where a long reach passes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub glyph: char,
@@ -39,29 +46,16 @@ pub struct Cell {
 impl Cell {
     /// The glyph and the connector to draw, heavy where their lines are.
     pub fn shown(&self) -> (char, char) {
-        let (v, h) = (self.v_heavy, self.h_heavy);
-        let pick = |both: char, v_only: char, h_only: char| match (v, h) {
-            (true, true) => both,
-            (true, false) => v_only,
-            (false, true) => h_only,
-            (false, false) => self.glyph,
-        };
-        let glyph = match self.glyph {
-            '│' if v => '┃',
-            '─' if h => '━',
-            '┼' => pick('╋', '╂', '┿'),
-            '┤' => pick('┫', '┨', '┥'),
-            '├' => pick('┣', '┠', '┝'),
-            '┴' => pick('┻', '┸', '┷'),
-            '┬' => pick('┳', '┰', '┯'),
-            '╯' if v || h => '┛',
-            '╰' if v || h => '┗',
-            '╮' if v || h => '┓',
-            '╭' if v || h => '┏',
-            g => g,
-        };
-        (glyph, if self.conn == '─' && self.conn_heavy { '━' } else { self.conn })
+        let glyph = if self.glyph == '│' && self.v_heavy { '┃' } else { self.glyph };
+        (glyph, self.conn)
     }
+}
+
+/// One commit's lines: its own, then the connector lines leading to the next commit's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub below: Vec<Vec<Cell>>,
 }
 
 /// Number of distinct lane colours; the UI maps each index to a terminal colour.
@@ -85,16 +79,30 @@ struct Lane {
     heavy: bool,
     /// The row the line started at; a younger line joins an older one heading the same way.
     born: usize,
+    /// The column the line leaves the current row from, when that is not the lane's own: the
+    /// row's commit for a line it starts, or the column the line stepped aside from.
+    leaves: Option<usize>,
 }
 
-/// Lays out the whole graph and returns the cells of each row, trailing blanks trimmed.
+/// A line between two consecutive rows, from a column of the upper to one of the lower.
+#[derive(Clone, Copy)]
+struct Edge {
+    from: usize,
+    to: usize,
+    color: u8,
+    heavy: bool,
+    /// The line starts at the upper row's commit, so its diagonal comes first.
+    from_node: bool,
+}
+
+/// Lays out the whole graph and returns each row's lines, trailing blanks trimmed.
 /// `spine` lists the rows kept in lane 0, top to bottom; it may be empty. `heavy[row]` marks
 /// the rows whose lines to their parents are heavy; it may be shorter than the rows.
 pub fn layout<'a>(
     parents: impl IntoIterator<Item = &'a [usize]>,
     spine: &[usize],
     heavy: &[bool],
-) -> Vec<Vec<Cell>> {
+) -> Vec<Row> {
     // With a spine, lane 0 is for it alone, and only ever waits for the next spine row.
     let first_lane = usize::from(!spine.is_empty());
     let spine_next: std::collections::HashMap<usize, Option<usize>> =
@@ -106,7 +114,10 @@ pub fn layout<'a>(
         next_color = (next_color + 1) % COLORS;
         c
     };
-    let mut rows = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
+    // The previous row's commit column, and its lines into lanes already open.
+    let mut prev_col = None;
+    let mut joins: Vec<Edge> = Vec::new();
     let all: Vec<&[usize]> = parents.into_iter().collect();
     let reserved = Reserved::new(&all, heavy, &spine_next);
     let is_heavy = |r: usize| heavy.get(r).copied().unwrap_or(false);
@@ -150,26 +161,41 @@ pub fn layout<'a>(
             lanes.push(None);
         }
 
+        // The connector from the previous row: every open lane goes on in its column, except
+        // the lines ending here, which turn into this commit.
+        if let Some(above) = rows.last_mut() {
+            let into = |j: usize| if hits.contains(&j) { col } else { j };
+            let mut edges: Vec<Edge> = lanes
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(j, l)| {
+                    let l = l.as_mut()?;
+                    let from = l.leaves.take().unwrap_or(j);
+                    Some(Edge { from, to: into(j), color: l.color, heavy: l.heavy, from_node: Some(from) == prev_col })
+                })
+                .collect();
+            edges.extend(joins.drain(..).map(|e| Edge { to: into(e.to), ..e }));
+            above.below = connector(&edges);
+        }
+
         let mut cells = vec![BLANK; lanes.len()];
         for (j, lane) in lanes.iter().enumerate() {
-            if let Some(l) = lane {
+            if let Some(l) = lane.filter(|_| !hits.contains(&j)) {
                 cells[j] = Cell { glyph: '│', color: l.color, v_heavy: l.heavy, ..BLANK };
             }
         }
         cells[col] = Cell { glyph: '●', color, v_heavy: row_heavy, ..BLANK };
 
-        // (column, colour, heavy) of every lane joined to the commit by a horizontal run.
-        let mut ends: Vec<(usize, u8, bool)> = Vec::new();
+        // Every other column the commit is joined to: lines ending here, lines it joins, lines
+        // it starts. The step aside for a merge on the next row keeps clear of them.
+        let mut ends: Vec<usize> = Vec::new();
         for &h in hits.iter().filter(|&&h| h != col) {
-            let lane = lanes[h].unwrap();
-            cells[h].glyph = if h > col { '╯' } else { '╰' };
-            cells[h].h_heavy = lane.heavy;
-            ends.push((h, lane.color, lane.heavy));
+            ends.push(h);
             lanes[h] = None;
         }
         // The lane goes on to the next spine row, else to the first parent; the other parents
         // branch off it. Off the spine, if an older line already heads for that parent, this
-        // one joins it here.
+        // one joins it under this row.
         let main = on_spine.unwrap_or_else(|| parents.first().copied());
         let born = match lanes[col] {
             _ if on_spine.is_some() => 0,
@@ -186,62 +212,40 @@ pub fn layout<'a>(
         let join = main
             .filter(|_| on_spine.is_none())
             .and_then(|p| (0..lanes.len()).find(|&j| j != col && older(&lanes[j], p)));
+        let join_edge = |to: usize| Edge { from: col, to, color, heavy: row_heavy, from_node: true };
         if let Some(j) = join {
-            cells[j].glyph = if j > col { '┤' } else { '├' };
-            cells[j].h_heavy = row_heavy;
-            ends.push((j, lanes[j].unwrap().color, row_heavy));
+            joins.push(join_edge(j));
+            ends.push(j);
             lanes[col] = None;
         } else {
-            lanes[col] = main.map(|p| Lane { waiting_for: p, color, heavy: row_heavy, born });
+            lanes[col] = main.map(|p| Lane { waiting_for: p, color, heavy: row_heavy, born, leaves: None });
         }
 
         for &p in parents.iter().filter(|&&p| Some(p) != main) {
             if let Some(j) = lanes.iter().position(|l| l.is_some_and(|l| l.waiting_for == p)) {
                 if j != col {
-                    cells[j].glyph = if j > col { '┤' } else { '├' };
-                    cells[j].h_heavy = row_heavy;
-                    ends.push((j, lanes[j].unwrap().color, row_heavy));
+                    joins.push(join_edge(j));
+                    ends.push(j);
                 }
                 continue;
             }
-            // A column freed on this row still shows its merge glyph, so skip those.
+            // A column freed on this row has its line turning into the commit, so skip those.
             let from = if row_heavy { col + 1 } else { (col + 1).max(outer(row, p)) };
-            let free = (from..lanes.len())
-                .find(|&j| lanes[j].is_none() && !hits.contains(&j) && cells[j].glyph == ' ');
+            let free = (from..lanes.len()).find(|&j| lanes[j].is_none() && !hits.contains(&j));
             let j = free.unwrap_or_else(|| {
                 while lanes.len() < from {
                     lanes.push(None);
-                    cells.push(BLANK);
                 }
                 lanes.push(None);
-                cells.push(BLANK);
                 lanes.len() - 1
             });
             let c = new_color();
-            lanes[j] = Some(Lane { waiting_for: p, color: c, heavy: row_heavy, born: row });
-            let glyph = if j > col { '╮' } else { '╭' };
-            cells[j] = Cell { glyph, color: c, v_heavy: row_heavy, h_heavy: row_heavy, ..BLANK };
-            ends.push((j, c, row_heavy));
-        }
-
-        for &(end, c, run_heavy) in &ends {
-            let (lo, hi) = (col.min(end), col.max(end));
-            for (k, cell) in cells.iter_mut().enumerate().take(hi).skip(lo) {
-                if k != lo {
-                    cell.glyph = crossed(cell.glyph);
-                    if cell.glyph == '─' {
-                        cell.color = c;
-                    }
-                    cell.h_heavy |= run_heavy;
-                }
-                cell.conn = '─';
-                cell.conn_color = c;
-                cell.conn_heavy |= run_heavy;
-            }
+            lanes[j] = Some(Lane { waiting_for: p, color: c, heavy: row_heavy, born: row, leaves: Some(col) });
+            ends.push(j);
         }
 
         if let Some(&next) = all.get(row + 1) {
-            make_room_for_merge(&mut lanes, &mut cells, row + 1, next, &spine_next, first_lane);
+            make_room_for_merge(&mut lanes, row + 1, next, &spine_next, first_lane, col, &hits, &ends);
         }
 
         while cells.last().is_some_and(|c| *c == BLANK) {
@@ -250,7 +254,8 @@ pub fn layout<'a>(
         while lanes.last().is_some_and(Option::is_none) {
             lanes.pop();
         }
-        rows.push(cells);
+        rows.push(Row { cells, below: Vec::new() });
+        prev_col = Some(col);
     }
     rows
 }
@@ -306,25 +311,30 @@ impl Reserved {
 }
 
 /// If row `next` is a merge whose merged branch will need a new lane, and the column right of
-/// where `next` will sit holds a line passing by, that line steps one column right on the
-/// current row (`cells`): `╰─╮`, or `●─╮` from the current row's own commit. Only when that is
-/// clean: the column beyond is free, and the line's cell has nothing else in it.
+/// where `next` will sit holds a line passing by, that line steps one column right under the
+/// current row. Only when that is clean: the column beyond is free, and none of the current
+/// row's own lines (from its commit at `col` to each of `ends`) reaches the line's column or
+/// the one beyond.
+#[allow(clippy::too_many_arguments)]
 fn make_room_for_merge(
     lanes: &mut Vec<Option<Lane>>,
-    cells: &mut Vec<Cell>,
     next: usize,
     parents: &[usize],
     spine_next: &std::collections::HashMap<usize, Option<usize>>,
     first_lane: usize,
+    col: usize,
+    hits: &[usize],
+    ends: &[usize],
 ) {
     if parents.len() < 2 {
         return;
     }
     let waiting = |p: usize| lanes.iter().position(|l| l.is_some_and(|l| l.waiting_for == p));
-    let hits: Vec<usize> = (0..lanes.len()).filter(|&j| lanes[j].is_some_and(|l| l.waiting_for == next)).collect();
-    let col = if spine_next.contains_key(&next) {
+    let next_hits: Vec<usize> =
+        (0..lanes.len()).filter(|&j| lanes[j].is_some_and(|l| l.waiting_for == next)).collect();
+    let next_col = if spine_next.contains_key(&next) {
         0
-    } else if let Some(&h) = hits.first() {
+    } else if let Some(&h) = next_hits.first() {
         h
     } else {
         (first_lane..lanes.len()).find(|&j| lanes[j].is_none()).unwrap_or(lanes.len().max(first_lane))
@@ -333,54 +343,123 @@ fn make_room_for_merge(
     if !parents.iter().any(|&p| Some(p) != main && waiting(p).is_none()) {
         return;
     }
-    let t = col + 1;
-    let Some(Some(lane)) = lanes.get(t).copied() else { return };
-    let beyond_free = lanes.get(t + 1).is_none_or(Option::is_none) && cells.get(t + 1).is_none_or(|c| *c == BLANK);
-    let clean = cells.get(t).is_some_and(|c| c.conn == ' ' && (c.glyph == '│' || c.glyph == '●'));
-    if hits.contains(&t) || !beyond_free || !clean {
+    let t = next_col + 1;
+    if !lanes.get(t).is_some_and(Option::is_some) || next_hits.contains(&t) {
+        return;
+    }
+    // Whether a line of the current row covers column k, ends included, or the gap right of it.
+    let covers = |k: usize| ends.iter().any(|&e| col.min(e) <= k && k <= col.max(e));
+    let covers_gap = |k: usize| ends.iter().any(|&e| col.min(e) <= k && k < col.max(e));
+    let beyond_free = lanes.get(t + 1).is_none_or(Option::is_none)
+        && t + 1 != col
+        && !hits.contains(&(t + 1))
+        && !covers(t + 1);
+    let clean = !ends.contains(&t) && !covers_gap(t);
+    if !beyond_free || !clean {
         return;
     }
     while lanes.len() <= t + 1 {
         lanes.push(None);
     }
-    while cells.len() <= t + 1 {
-        cells.push(BLANK);
-    }
-    lanes[t + 1] = lanes[t].take();
-    if cells[t].glyph == '│' {
-        cells[t].glyph = '╰';
-        cells[t].h_heavy = lane.heavy;
-    }
-    cells[t].conn = '─';
-    cells[t].conn_color = lane.color;
-    cells[t].conn_heavy = lane.heavy;
-    cells[t + 1] = Cell { glyph: '╮', color: lane.color, v_heavy: lane.heavy, h_heavy: lane.heavy, ..BLANK };
+    let mut lane = lanes[t].take().unwrap();
+    lane.leaves = lane.leaves.or(Some(t));
+    lanes[t + 1] = Some(lane);
 }
 
-/// The glyph a cell shows when a horizontal run passes through it.
-fn crossed(glyph: char) -> char {
-    match glyph {
-        ' ' => '─',
-        '│' | '┤' | '├' => '┼',
-        '╯' | '╰' => '┴',
-        '╮' | '╭' => '┬',
-        g => g,
+/// The connector lines between two rows, for lines going from a column of the upper row to one
+/// of the lower: none when every line goes straight down, one for steps to the next column,
+/// two for longer reaches. A step's diagonal is on the first line for a line leaving the upper
+/// commit, else on the last, next to where it arrives.
+fn connector(edges: &[Edge]) -> Vec<Vec<Cell>> {
+    let height = edges.iter().map(|e| e.from.abs_diff(e.to)).max().unwrap_or(0).min(2);
+    if height == 0 {
+        return Vec::new();
     }
+    let width = edges.iter().map(|e| e.from.max(e.to) + 1).max().unwrap_or(0);
+    let mut lines = vec![vec![BLANK; width]; height];
+    // Light lines first, so heavy ones win where they share a character; verticals, then
+    // runs, then diagonals, which go over runs.
+    let mut edges = edges.to_vec();
+    edges.sort_by_key(|e| e.heavy);
+    let put = |line: &mut Vec<Cell>, x: usize, ch: char, e: &Edge| {
+        let cell = &mut line[x / 2];
+        if x.is_multiple_of(2) {
+            match ch {
+                // Two lines down the same lane: a heavy one wins.
+                '│' if cell.glyph == '│' && (cell.v_heavy || !e.heavy) => {}
+                '│' => *cell = Cell { glyph: '│', color: e.color, v_heavy: e.heavy, ..*cell },
+                _ if cell.glyph == ' ' || cell.glyph == '_' => {
+                    *cell = Cell { glyph: ch, color: e.color, h_heavy: e.heavy, ..*cell }
+                }
+                _ => {}
+            }
+        } else {
+            let ch = match (cell.conn, ch) {
+                ('╱', '╲') | ('╲', '╱') | ('╳', _) => '╳',
+                ('╱' | '╲', '_') => return,
+                _ => ch,
+            };
+            *cell = Cell { conn: ch, conn_color: e.color, conn_heavy: e.heavy, ..*cell };
+        }
+    };
+    for e in edges.iter().filter(|e| e.from == e.to) {
+        for line in &mut lines {
+            put(line, 2 * e.from, '│', e);
+        }
+    }
+    for e in edges.iter().filter(|e| e.from.abs_diff(e.to) == 1) {
+        let (a, b) = (e.from, e.to);
+        let at = if e.from_node { 0 } else { height - 1 };
+        for (i, line) in lines.iter_mut().enumerate() {
+            match i.cmp(&at) {
+                std::cmp::Ordering::Less => put(line, 2 * a, '│', e),
+                std::cmp::Ordering::Equal => put(line, 2 * a.min(b) + 1, if b > a { '╲' } else { '╱' }, e),
+                std::cmp::Ordering::Greater => put(line, 2 * b, '│', e),
+            }
+        }
+    }
+    let long: Vec<&Edge> = edges.iter().filter(|e| e.from.abs_diff(e.to) > 1).collect();
+    for e in &long {
+        let (lo, hi) = (e.from.min(e.to), e.from.max(e.to));
+        for x in 2 * lo + 2..=2 * hi - 2 {
+            put(&mut lines[0], x, '_', e);
+        }
+    }
+    for e in &long {
+        let (a, b) = (e.from, e.to);
+        if b > a {
+            put(&mut lines[0], 2 * a + 1, '╲', e);
+            put(&mut lines[1], 2 * b - 1, '╲', e);
+        } else {
+            put(&mut lines[0], 2 * a - 1, '╱', e);
+            put(&mut lines[1], 2 * b + 1, '╱', e);
+        }
+    }
+    for line in &mut lines {
+        while line.last().is_some_and(|c| *c == BLANK) {
+            line.pop();
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn draw(parents: &[&[usize]]) -> String {
-        layout(parents.iter().copied(), &[], &[])
-            .iter()
-            .map(|row| {
-                let s: String = row.iter().flat_map(|c| [c.glyph, c.conn]).collect();
+    /// Every line of the graph, each commit's followed by its connector lines.
+    fn lines(rows: &[Row], text: impl Fn(&Cell) -> (char, char)) -> Vec<String> {
+        rows.iter()
+            .flat_map(|row| std::iter::once(&row.cells).chain(&row.below))
+            .map(|cells| {
+                let s: String = cells.iter().flat_map(|c| { let (g, k) = text(c); [g, k] }).collect();
                 s.trim_end().to_string()
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    fn draw(parents: &[&[usize]]) -> String {
+        render(parents, &[]).join("\n")
     }
 
     #[test]
@@ -391,20 +470,21 @@ mod tests {
     #[test]
     fn fork_and_merge() {
         // 0 merges 1 and 2, both of which fork from 3.
-        let got = draw(&[&[1, 2], &[3], &[3], &[]]);
-        assert_eq!(got, "●─╮\n● │\n│ ●\n●─╯");
+        let got = render(&[&[1, 2], &[3], &[3], &[]], &[]);
+        assert_eq!(got, ["●", "│╲", "● │", "│ ●", "│╱", "●"]);
     }
 
     #[test]
     fn two_tips_join() {
         // Two branch tips (0, 1) with a common parent 2: the younger joins the older line.
-        assert_eq!(draw(&[&[2], &[2], &[]]), "●\n├─●\n●");
+        assert_eq!(render(&[&[2], &[2], &[]], &[]), ["●", "│ ●", "│╱", "●"]);
     }
 
     #[test]
     fn octopus() {
-        let got = draw(&[&[1, 2, 3], &[4], &[4], &[4], &[]]);
-        assert_eq!(got, "●─┬─╮\n● │ │\n│ ● │\n│ │ ●\n●─┴─╯");
+        // The third parent is two columns away: it reaches there along `_`.
+        let got = render(&[&[1, 2, 3], &[4], &[4], &[4], &[]], &[]);
+        assert_eq!(got, ["●", "│╲_", "│ │╲", "● │ │", "│ ● │", "│ │ ●", "│ │╱", "│╱", "●"]);
     }
 
     #[test]
@@ -415,15 +495,16 @@ mod tests {
     #[test]
     fn criss_cross() {
         // 0 and 1 are both merges of 2 and 3.
-        let got = draw(&[&[2, 3], &[3, 2], &[4], &[4], &[]]);
-        assert_eq!(got, "●─╮\n├─┼─●\n● │\n│ ●\n●─╯");
+        // 1's line to 2 crosses 0's line to 3, as in git's `|/|`.
+        let got = render(&[&[2, 3], &[3, 2], &[4], &[4], &[]], &[]);
+        assert_eq!(got, ["●", "│╲", "│ │ ●", "│ │╱", "│╱│", "● │", "│ ●", "│╱", "●"]);
     }
 
     #[test]
     fn merge_into_existing_lane() {
         // 0 is a tip on 2; 1 merges 3 and 2, so its second parent joins lane 0.
-        let got = draw(&[&[2], &[3, 2], &[3], &[]]);
-        assert_eq!(got, "●\n├─●\n● │\n●─╯");
+        let got = render(&[&[2], &[3, 2], &[3], &[]], &[]);
+        assert_eq!(got, ["●", "│ ●", "│╱│", "● │", "│╱", "●"]);
     }
 
     #[test]
@@ -436,45 +517,36 @@ mod tests {
     fn spine_keeps_the_left_lane() {
         // 0 is a newer tip on 2; 1 is the layout head, also on 2.
         let parents: &[&[usize]] = &[&[2], &[2], &[]];
-        // Without a spine the younger tip joins the older line on its own row.
+        // Without a spine the younger tip joins the older line under its own row.
         let plain: Vec<String> = render(parents, &[]);
-        assert_eq!(plain, ["●", "├─●", "●"]);
+        assert_eq!(plain, ["●", "│ ●", "│╱", "●"]);
         // With 1 and 2 as the spine, the tip moves right and lane 0 waits for the head.
-        assert_eq!(render(parents, &[1, 2]), ["  ●", "● │", "●─╯"]);
+        assert_eq!(render(parents, &[1, 2]), ["  ●", "● │", "│╱", "●"]);
     }
 
     #[test]
     fn spine_takes_merges_from_the_right() {
         // The head 0 merges 2 (first parent) and 1; 1 and 2 fork from 3.
         let parents: &[&[usize]] = &[&[2, 1], &[3], &[3], &[]];
-        assert_eq!(render(parents, &[0, 2, 3]), ["●─╮", "│ ●", "● │", "●─╯"]);
+        assert_eq!(render(parents, &[0, 2, 3]), ["●", "│╲", "│ ●", "● │", "│╱", "●"]);
     }
 
     #[test]
     fn spine_can_follow_a_second_parent() {
         // 0 merges 1 (first parent) and 2; the spine goes 0 -> 2 -> 3, so 1 branches off.
         let parents: &[&[usize]] = &[&[1, 2], &[3], &[3], &[]];
-        assert_eq!(render(parents, &[0, 2, 3]), ["●─╮", "│ ●", "● │", "●─╯"]);
+        assert_eq!(render(parents, &[0, 2, 3]), ["●", "│╲", "│ ●", "● │", "│╱", "●"]);
         // Without a spine the first parent stays in line.
-        assert_eq!(render(parents, &[]), ["●─╮", "● │", "│ ●", "●─╯"]);
+        assert_eq!(render(parents, &[]), ["●", "│╲", "● │", "│ ●", "│╱", "●"]);
     }
 
     fn render(parents: &[&[usize]], spine: &[usize]) -> Vec<String> {
-        layout(parents.iter().copied(), spine, &[])
-            .iter()
-            .map(|row| row.iter().flat_map(|c| [c.glyph, c.conn]).collect::<String>().trim_end().to_string())
-            .collect()
+        lines(&layout(parents.iter().copied(), spine, &[]), |c| (c.glyph, c.conn))
     }
 
     /// The glyphs as drawn, heavy ones included.
     fn render_heavy(parents: &[&[usize]], spine: &[usize], heavy: &[bool]) -> Vec<String> {
-        layout(parents.iter().copied(), spine, heavy)
-            .iter()
-            .map(|row| {
-                let s: String = row.iter().flat_map(|c| { let (g, k) = c.shown(); [g, k] }).collect();
-                s.trim_end().to_string()
-            })
-            .collect()
+        lines(&layout(parents.iter().copied(), spine, heavy), Cell::shown)
     }
 
     #[test]
@@ -483,20 +555,24 @@ mod tests {
         let parents: &[&[usize]] = &[&[1, 2], &[3], &[3], &[]];
         let heavy = [false, true, false, true];
         // 2's light line joins the heavy one heading for 3.
-        assert_eq!(render_heavy(parents, &[], &heavy), ["●─╮", "● │", "┠─●", "●"]);
-        // Heavy from 0: everything is.
+        assert_eq!(render_heavy(parents, &[], &heavy), ["●", "│╲", "● │", "┃ ●", "┃╱", "●"]);
+        // Heavy from 0: everything is (diagonals are heavy too, though they look the same).
         let heavy = [true; 4];
-        assert_eq!(render_heavy(parents, &[], &heavy), ["●━┓", "● ┃", "┃ ●", "●━┛"]);
+        assert_eq!(render_heavy(parents, &[], &heavy), ["●", "┃╲", "● ┃", "┃ ●", "┃╱", "●"]);
+        let rows = layout(parents.iter().copied(), &[], &heavy);
+        assert!(rows[0].below[0][0].conn_heavy && rows[2].below[0][0].conn_heavy);
     }
 
     #[test]
     fn heavy_and_light_lines_cross() {
-        // The criss-cross: light row 1 joins lane 0 (0's heavy line to 2) with a run that
-        // passes over lane 1 (0's heavy line to 3).
+        // The criss-cross: light row 1 joins lane 0 (0's heavy line to 2) with a long reach
+        // that crosses lane 1 (0's heavy line to 3).
         let parents: &[&[usize]] = &[&[2, 3], &[3, 2], &[4], &[4], &[]];
         let heavy = [true, false, true, true, true];
-        let rows = render_heavy(parents, &[], &heavy);
-        assert_eq!(rows[1], "┠─╂─●", "light joins and crosses heavy lanes");
+        let lines = render_heavy(parents, &[], &heavy);
+        assert_eq!(lines[2..5], ["┃ ┃ ●", "┃ ┃╱", "┃╱┃"], "light joins and crosses heavy lanes");
+        let rows = layout(parents.iter().copied(), &[], &heavy);
+        assert!(!rows[1].below[1][0].conn_heavy, "the light reach stays light");
     }
 
     #[test]
@@ -511,8 +587,8 @@ mod tests {
         assert_eq!(
             render(parents, &spine),
             [
-                "●─╮", "│ ●", "│ ●─╮", "●─╮ │", "│ ● │", "│ ● │", "│ ●─┤", "●   │", "●─╮ │", "│ ● │",
-                "│ ●─┤", "●   │", "●───╯",
+                "●", "│╲", "│ ●", "│ ●", "│  ╲", "●   │", "│╲  │", "│ ● │", "│ ● │", "│ ● │", "│  ╲│",
+                "●   │", "●   │", "│╲  │", "│ ● │", "│ ● │", "│  ╲│", "●   │", "│ _╱", "│╱", "●",
             ]
         );
     }
@@ -524,10 +600,16 @@ mod tests {
         let parents: &[&[usize]] = &[&[4], &[3, 2], &[3], &[4], &[]];
         let spine = [1, 3, 4];
         // Unmarked, the tip takes column 1 and has to step aside for the merge.
-        assert_eq!(render(parents, &spine), ["  ●─╮", "●─╮ │", "├─● │", "●   │", "●───╯"]);
+        assert_eq!(
+            render(parents, &spine),
+            ["  ●", "   ╲", "●   │", "│╲  │", "│ ● │", "│╱  │", "●   │", "│ _╱", "│╱", "●"]
+        );
         // With the head's history marked, the tip starts right of the column it needs.
         let heavy = [false, true, true, true, true];
-        assert_eq!(render_heavy(parents, &spine, &heavy), ["    ●", "●━┓ │", "┣━● │", "●   │", "●───╯"]);
+        assert_eq!(
+            render_heavy(parents, &spine, &heavy),
+            ["    ●", "●   │", "┃╲  │", "┃ ● │", "┃╱  │", "●   │", "┃ _╱", "┃╱", "●"]
+        );
     }
 
     #[test]
@@ -538,16 +620,19 @@ mod tests {
         let parents: &[&[usize]] = &[&[3], &[4, 2], &[3], &[4], &[]];
         let spine = [1, 4];
         let heavy = [false, true, true, true, true];
-        // (3 also joins the spine early, taking the outside line in on the same row.)
-        assert_eq!(render_heavy(parents, &spine, &heavy), ["    ●", "●━┓ │", "┃ ● │", "┣━●─╯", "●"]);
+        // (3 also joins the spine early, under its row.)
+        assert_eq!(
+            render_heavy(parents, &spine, &heavy),
+            ["    ●", "●   │", "┃╲  │", "┃ ● │", "┃ ┃╱", "┃ ●", "┃╱", "●"]
+        );
         // Unmarked, the younger line through 2 joins the older one.
-        assert_eq!(render(parents, &spine)[2], "│ ●─┤");
+        assert_eq!(render(parents, &spine)[4..6], ["│ ● │", "│  ╲│"]);
     }
 
     #[test]
     fn run_over_freed_lane() {
-        // 4's run to lane 2 passes over lane 1, freed when 3 merged it.
-        let got = draw(&[&[3], &[2, 4], &[3], &[4], &[]]);
-        assert_eq!(got, "●\n│ ●─╮\n├─● │\n●   │\n●───╯");
+        // Lane 2's long reach into 4 passes column 1, freed when 2 joined lane 0.
+        let got = render(&[&[3], &[2, 4], &[3], &[4], &[]], &[]);
+        assert_eq!(got, ["●", "│ ●", "│ │╲", "│ ● │", "│╱  │", "●   │", "│ _╱", "│╱", "●"]);
     }
 }

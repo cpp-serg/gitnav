@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::graph::{self, Cell};
+use crate::graph;
 use crate::matcher::{self, Mode};
 use crate::repo::{self, History, View};
 
@@ -138,7 +138,7 @@ fn spine(commits: &[repo::Commit], head: usize) -> Vec<usize> {
 
 pub struct App {
     pub history: History,
-    pub graph: Vec<Vec<Cell>>,
+    pub graph: Vec<graph::Row>,
     /// The row laid out as the head: `view.head` if it is shown, else HEAD's.
     pub head_row: Option<usize>,
     pub cursor: usize,
@@ -146,7 +146,7 @@ pub struct App {
     pub offset: usize,
     /// Columns scrolled off to the left.
     pub hscroll: usize,
-    /// Visible rows, as of the last draw.
+    /// Visible lines, as of the last draw; a row can take more than one.
     pub height: usize,
     /// The window's width, as of the last draw.
     pub width: usize,
@@ -251,7 +251,7 @@ impl App {
     /// keeps it in view.
     pub fn settle(&mut self) {
         if std::mem::take(&mut self.center_cursor) {
-            self.offset = self.cursor.saturating_sub(self.height / 2);
+            self.offset = self.top_for(self.cursor, self.height / 2);
         }
         self.clamp();
     }
@@ -319,6 +319,36 @@ impl App {
         self.len().saturating_sub(1)
     }
 
+    /// The screen lines a row takes: its commit's, and the connector lines under it.
+    fn lines_of(&self, row: usize) -> usize {
+        1 + self.graph.get(row).map_or(0, |r| r.below.len())
+    }
+
+    /// How many rows from `top` on have their commit's line on the screen.
+    fn shown_from(&self, top: usize) -> usize {
+        let (mut used, mut rows) = (0, 0);
+        while top + rows < self.len() && used < self.height.max(1) {
+            used += self.lines_of(top + rows);
+            rows += 1;
+        }
+        rows
+    }
+
+    /// The top row that puts `row`'s commit line as far down as screen line `line` goes.
+    fn top_for(&self, row: usize, line: usize) -> usize {
+        let (mut top, mut used) = (row, 0);
+        while top > 0 && used + self.lines_of(top - 1) <= line {
+            top -= 1;
+            used += self.lines_of(top);
+        }
+        top
+    }
+
+    /// The last row whose commit's line is on the screen.
+    fn bottom(&self) -> usize {
+        (self.offset + self.shown_from(self.offset).max(1) - 1).min(self.last())
+    }
+
     /// Whether a row shows as selected: marked, or inside the visual range.
     pub fn is_selected(&self, row: usize) -> bool {
         self.marks.contains(&row)
@@ -372,7 +402,7 @@ impl App {
         let count = self.count.take();
         let n = count.unwrap_or(1);
         let prefix = self.prefix.take();
-        let page = self.height.max(1);
+        let page = self.shown_from(self.offset).max(1);
 
         match (prefix, key.code, ctrl) {
             (Some('g'), KeyCode::Char('g'), false) => self.cursor = count.map_or(0, |c| c - 1),
@@ -384,11 +414,11 @@ impl App {
                 None => self.message = Some("the head is not shown".into()),
             },
             (Some('z'), KeyCode::Char('z'), false) => {
-                self.offset = self.cursor.saturating_sub(page / 2)
+                self.offset = self.top_for(self.cursor, self.height / 2)
             }
             (Some('z'), KeyCode::Char('t'), false) => self.offset = self.cursor,
             (Some('z'), KeyCode::Char('b'), false) => {
-                self.offset = (self.cursor + 1).saturating_sub(page)
+                self.offset = self.top_for(self.cursor, self.height.saturating_sub(1))
             }
             (Some(_), _, _) => {}
 
@@ -409,13 +439,18 @@ impl App {
             (None, KeyCode::Char('d'), true) => self.scroll_both(page / 2, true),
             (None, KeyCode::Char('u'), true) => self.scroll_both(page / 2, false),
             (None, KeyCode::Char('f'), true) | (None, KeyCode::PageDown, false) => {
-                self.offset += page * n;
+                for _ in 0..n {
+                    self.offset += self.shown_from(self.offset).max(1);
+                }
                 self.offset = self.offset.min(self.max_offset());
                 self.cursor = self.cursor.max(self.offset);
             }
             (None, KeyCode::Char('b'), true) | (None, KeyCode::PageUp, false) => {
-                self.offset = self.offset.saturating_sub(page * n);
-                self.cursor = self.cursor.min(self.offset + page - 1);
+                for _ in 0..n {
+                    // The row above the view goes to the bottom.
+                    self.offset = self.top_for(self.offset.saturating_sub(1), self.height.saturating_sub(1));
+                }
+                self.cursor = self.cursor.min(self.bottom());
             }
             (None, KeyCode::Char('e'), true) => {
                 self.offset = (self.offset + n).min(self.max_offset());
@@ -423,16 +458,14 @@ impl App {
             }
             (None, KeyCode::Char('y'), true) => {
                 self.offset = self.offset.saturating_sub(n);
-                self.cursor = self.cursor.min(self.offset + page - 1);
+                self.cursor = self.cursor.min(self.bottom());
             }
             (None, KeyCode::Char('H'), false) => self.cursor = self.offset + n - 1,
             (None, KeyCode::Char('L'), false) => {
-                let bottom = (self.offset + page - 1).min(self.last());
-                self.cursor = bottom.saturating_sub(n - 1).max(self.offset);
+                self.cursor = self.bottom().saturating_sub(n - 1).max(self.offset);
             }
             (None, KeyCode::Char('M'), false) => {
-                let shown = page.min(self.len() - self.offset.min(self.len()));
-                self.cursor = self.offset + shown.saturating_sub(1) / 2;
+                self.cursor = self.offset + self.shown_from(self.offset).saturating_sub(1) / 2;
             }
             (None, KeyCode::Char('h') | KeyCode::Left, false) => {
                 self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP * n)
@@ -755,19 +788,19 @@ impl App {
         }
     }
 
+    /// The top row that has the last row at the bottom of the screen.
     fn max_offset(&self) -> usize {
-        self.len().saturating_sub(self.height.max(1))
+        self.top_for(self.last(), self.height.saturating_sub(1))
     }
 
     /// Keeps the cursor on a row and the view on the cursor.
     pub fn clamp(&mut self) {
-        let page = self.height.max(1);
         self.cursor = self.cursor.min(self.last());
         self.offset = self.offset.min(self.max_offset());
         if self.cursor < self.offset {
             self.offset = self.cursor;
-        } else if self.cursor >= self.offset + page {
-            self.offset = self.cursor + 1 - page;
+        } else if self.cursor >= self.offset + self.shown_from(self.offset) {
+            self.offset = self.top_for(self.cursor, self.height.saturating_sub(1));
         }
     }
 }
@@ -971,8 +1004,8 @@ mod tests {
         a.relayout();
         assert_eq!((a.head_row, a.view.head), (Some(2), Some(a.history.commits[2].oid)));
         // Rows above the head keep off the spine's lane.
-        assert_eq!(a.graph[0][0].glyph, ' ');
-        assert_eq!(a.graph[2][0].glyph, '●');
+        assert_eq!(a.graph[0].cells[0].glyph, ' ');
+        assert_eq!(a.graph[2].cells[0].glyph, '●');
         keys(&mut a, "@");
         a.relayout();
         assert_eq!((a.head_row, a.view.head), (Some(0), None));
@@ -1094,9 +1127,31 @@ mod tests {
         };
         // Nothing above the head is newer: the head is the top row.
         assert_eq!(timed(7, &[(2, 50)]), (7, 7));
-        // Something above it is newer: the head is centred, with those above it in view.
-        assert_eq!(timed(7, &[(2, 150), (5, 200)]), (7, 2));
+        // Something above it is newer: the head is centred, with those above it in view. The
+        // rows above it join the head's line on a connector line, which takes a screen line.
+        assert_eq!(timed(7, &[(2, 150), (5, 200)]), (7, 3));
         assert_eq!(timed(3, &[(0, 150)]), (3, 0));
+    }
+
+    #[test]
+    fn scrolling_counts_connector_lines() {
+        // 0 merges 1 and 2, both on 3: a connector line under 0 (│╲) and under 2 (│╱), so the
+        // four rows take six lines.
+        let mut h = history(&[0, 1, 2, 3]);
+        h.commits[0].parents = vec![1, 2];
+        h.commits[1].parents = vec![3];
+        let mut a = App::new(h, View::default());
+        assert_eq!(a.graph.iter().map(|r| r.below.len()).collect::<Vec<_>>(), [1, 0, 1, 0]);
+        a.height = 3;
+        keys(&mut a, "G");
+        a.clamp();
+        assert_eq!((a.cursor, a.offset), (3, 2), "2, its connector line and 3 fill the screen");
+        ctrl(&mut a, 'b');
+        assert_eq!((a.cursor, a.offset), (1, 0), "0 and its connector line, then 1");
+        keys(&mut a, "M");
+        assert_eq!(a.cursor, 0);
+        ctrl(&mut a, 'f');
+        assert_eq!((a.cursor, a.offset), (2, 2));
     }
 
     #[test]
@@ -1111,7 +1166,8 @@ mod tests {
         a.settle();
         keys(&mut a, "gh");
         a.settle();
-        assert_eq!((a.cursor, a.offset), (20, 15));
+        // Centred: the connector line above the head counts.
+        assert_eq!((a.cursor, a.offset), (20, 16));
     }
 
     #[test]
@@ -1124,9 +1180,9 @@ mod tests {
             c.time = 100 - i as i64;
         }
         let a = App::new(h, View::default());
-        assert!(a.graph.iter().all(|row| row.len() == 1 && row[0].glyph == '●'), "a straight line");
+        assert!(a.graph.iter().all(|row| row.cells.len() == 1 && row.cells[0].glyph == '●'), "a straight line");
         assert_eq!(a.head_row, Some(3));
-        let heavy: Vec<bool> = a.graph.iter().map(|row| row[0].v_heavy).collect();
+        let heavy: Vec<bool> = a.graph.iter().map(|row| row.cells[0].v_heavy).collect();
         assert_eq!(heavy, [false, false, false, true, true, true], "heavy from the head down");
     }
 

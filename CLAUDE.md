@@ -49,13 +49,16 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   line, so a blocked parent comes as soon as possible. Topo and Date begin with the layout head
   and what leads to it. In first-parent mode only first parents order and draw anything, which
   matches git when it uses a commit-graph file.
-- **`graph.rs`** lays out lanes, one row per commit. Lanes keep their column; the only sideways
-  move is the one-row step a line takes to make room for a merge's source next to its target.
-  Inputs besides the parents: the *spine* (the head's line, always lane 0, which nothing else
-  may use) and *heavy* rows (the head and everything it reaches, drawn with heavy box glyphs via
-  `Cell::shown`). Lines heading for the same commit join early: a head-history line never gives
-  way to an outside one, otherwise the younger joins the older. `Reserved` counts the
-  head-history lines open per row so outside lines are placed to the right of them.
+- **`graph.rs`** lays out lanes, one `Row` per commit: the commit's line, and under it the
+  connector lines where lines change column, as in `git log --graph` (`╲`/`╱` for a step to the
+  next column, `_` between two diagonals for a longer reach; commit lines have no horizontal
+  runs). Lanes keep their column; the only sideways move is the step a line takes to make room
+  for a merge's source next to its target. Inputs besides the parents: the *spine* (the head's
+  line, always lane 0, which nothing else may use) and *heavy* rows (the head and everything it
+  reaches, drawn with `┃` via `Cell::shown`, and bold where no heavy glyph exists). Lines
+  heading for the same commit join early: a head-history line never gives way to an outside
+  one, otherwise the younger joins the older. `Reserved` counts the head-history lines open per
+  row so outside lines are placed to the right of them.
 - **`app.rs`** holds UI state and key handling and does no I/O: keys set `reload` or `command`
   and `main.rs` acts on them. Two layers of state:
   - `View` (order, deleted, hidden refs, refs-only, chosen head, first-parent) changes what
@@ -64,8 +67,10 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
     loaded history) without reloading.
 
   `swap_rows` keeps the cursor, marks and visual anchor on the same commits across any change of
-  rows. `relayout` computes the spine and heavy set and calls `graph::layout`. `HELP` is the one
-  key table: add a key's line there along with its handler.
+  rows. `offset` is a row but `height` is screen lines, and a row can take several: scrolling
+  goes through `shown_from`, `top_for` and `bottom`. `relayout` computes the spine and heavy set
+  and calls `graph::layout`. `HELP` is the one key table: add a key's line there along with its
+  handler.
 - **`ui.rs`**: `History::line(row)` is the text that search and filter match. The text spans in
   `commit_line` must concatenate to exactly that string (a test checks it), because highlight
   positions are character offsets into it. Anything drawn in addition (the merge count after

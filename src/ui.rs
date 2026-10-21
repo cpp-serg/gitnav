@@ -54,14 +54,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let rows = app.offset..(app.offset + app.height).min(app.len());
-    let lines: Vec<Line> = rows.clone().map(|row| commit_line(app, row)).collect();
+    // Each row's commit line and then the connector lines under it, while the screen has room;
+    // for each line, its row and whether it is the commit's own.
+    let mut lines: Vec<Line> = Vec::new();
+    let mut owners: Vec<(usize, bool)> = Vec::new();
+    for row in app.offset..app.len() {
+        if lines.len() >= app.height {
+            break;
+        }
+        lines.push(commit_line(app, row));
+        owners.push((row, true));
+        for cells in app.graph.get(row).map_or(&[][..], |r| &r.below) {
+            lines.push(connector_line(cells));
+            owners.push((row, false));
+        }
+    }
+    lines.truncate(app.height);
     frame.render_widget(Paragraph::new(lines).scroll((0, app.hscroll as u16)), list);
 
     let buf = frame.buffer_mut();
-    for (y, row) in (list.y..).zip(rows) {
-        let selected = app.is_selected(row);
-        let bg = match (row == app.cursor, selected) {
+    for (y, &(row, own)) in (list.y..list.bottom()).zip(&owners) {
+        // A connector line is selected along with the rows on both sides of it.
+        let selected = app.is_selected(row) && (own || app.is_selected(row + 1));
+        let bg = match (own && row == app.cursor, selected) {
             (true, true) => Some(CURSOR_SELECTED_BG),
             (true, false) => Some(CURSOR_BG),
             (false, true) => Some(SELECTED_BG),
@@ -78,7 +93,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         if selected {
             buf[(gutter.x, y)].set_char('▍').set_fg(MARK_GUTTER);
-        } else if app.head_row == Some(row) {
+        } else if own && app.head_row == Some(row) {
             buf[(gutter.x, y)].set_char('▶').set_fg(head_color(app, row));
         }
     }
@@ -180,14 +195,30 @@ fn lane(i: u8) -> Color {
     LANE_COLORS[i as usize % LANE_COLORS.len()]
 }
 
+fn weight(heavy: bool) -> Modifier {
+    if heavy { Modifier::BOLD } else { Modifier::empty() }
+}
+
+/// A connector line between two commits' lines: the graph alone.
+fn connector_line(cells: &[crate::graph::Cell]) -> Line<'static> {
+    let spans = cells.iter().flat_map(|cell| {
+        let (glyph, conn) = cell.shown();
+        [
+            Span::styled(glyph.to_string(), Style::new().fg(lane(cell.color)).add_modifier(weight(cell.v_heavy || cell.h_heavy))),
+            Span::styled(conn.to_string(), Style::new().fg(lane(cell.conn_color)).add_modifier(weight(cell.conn_heavy))),
+        ]
+    });
+    Line::from(spans.collect::<Vec<_>>())
+}
+
 /// One row, formatted like `logpretty`: `%h - (%as) %s -%d(%an)` after the graph.
 fn commit_line(app: &App, row: usize) -> Line<'_> {
     let c = &app.history.commits[row];
     let mut spans: Vec<Span> = Vec::new();
     let is_head = app.head_row == Some(row);
-    for cell in app.graph.get(row).map_or(&[][..], |r| r) {
+    let cells = app.graph.get(row).map_or(&[][..], |r| &r.cells);
+    for cell in cells {
         let (glyph, conn) = cell.shown();
-        let weight = |heavy: bool| if heavy { Modifier::BOLD } else { Modifier::empty() };
         let style = Style::new().fg(lane(cell.color)).add_modifier(weight(cell.v_heavy || cell.h_heavy));
         // With first parents only, a merge's other side is not drawn: mark the merge.
         let hidden_merge = glyph == '●' && c.merge && app.view.first_parent;
@@ -202,7 +233,7 @@ fn commit_line(app: &App, row: usize) -> Line<'_> {
         if hidden_merge && conn == ' ' {
             // A stub for the merged side that is not shown. With a line to the right only the
             // one-character gap is free for it.
-            let last = app.graph.get(row).is_some_and(|r| std::ptr::eq(cell, r.last().unwrap()));
+            let last = std::ptr::eq(cell, cells.last().unwrap());
             spans.push(Span::styled(if last { "━┄ " } else { "━" }, style));
         } else {
             spans.push(Span::styled(conn.to_string(), conn_style));
