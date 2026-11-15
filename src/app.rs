@@ -1,7 +1,5 @@
 //! Navigation state and vi-style key handling.
 
-use std::collections::BTreeSet;
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::graph;
@@ -27,9 +25,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("h l  ← →", "scroll sideways"),
     ("0", "scroll back to the left edge"),
     ("Enter", "show the commit (git show); j k, Ctrl-d Ctrl-u, Space, gg G scroll; q Esc Enter close"),
+    ("d", "diff two selected commits: git diff <second selected> <first selected>"),
     ("", "Selecting"),
-    ("Space", "mark or unmark the commit, move down"),
-    ("v", "start a range; v again marks it"),
+    ("Space", "mark or unmark the commit, move down (marks keep the order they were made in)"),
+    ("v", "start a range; v again marks it, from where it started"),
     ("Esc", "cancel the range, or clear the search highlight"),
     ("U", "clear all marks"),
     ("", "Search and filter"),
@@ -44,7 +43,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("", "View"),
     ("@", "lay out around the commit as if it were HEAD; again: back to HEAD"),
     ("o", "switch order: topo, date, git-topo"),
-    ("d", "deleted commits: hide, reflog, all"),
+    ("sd", "deleted commits: hide, reflog, all"),
     ("x", "hide the refs on the commit (or the marked ones) and what only they reach"),
     ("X", "hidden refs: hide, show again"),
     ("^", "first parents only; merges show as ◆━┄ with the count they brought in: on, off"),
@@ -63,6 +62,8 @@ pub enum Command {
     AbortRebase,
     /// Show a commit's contents (`git show`).
     Show(git2::Oid),
+    /// The diff between two commits, in the order they were selected (`git diff a b`).
+    Diff(git2::Oid, git2::Oid),
 }
 
 /// A scrollable text view over the graph, such as a commit's `git show`.
@@ -150,11 +151,12 @@ pub struct App {
     pub height: usize,
     /// The window's width, as of the last draw.
     pub width: usize,
-    pub marks: BTreeSet<usize>,
+    /// Marked rows, in the order they were marked.
+    pub marks: Vec<usize>,
     /// Where visual mode started, while it is active.
     pub visual: Option<usize>,
     pub count: Option<usize>,
-    /// First key of a two-key command (`g`, `z`).
+    /// First key of a two-key command (`g`, `z`, `s`).
     pub prefix: Option<char>,
     /// Row order and which deleted commits to show; changing it needs a reload.
     pub view: View,
@@ -204,7 +206,7 @@ impl App {
             hscroll: 0,
             height: 1,
             width: 80,
-            marks: BTreeSet::new(),
+            marks: Vec::new(),
             visual: None,
             count: None,
             prefix: None,
@@ -420,9 +422,13 @@ impl App {
             (Some('z'), KeyCode::Char('b'), false) => {
                 self.offset = self.top_for(self.cursor, self.height.saturating_sub(1))
             }
+            (Some('s'), KeyCode::Char('d'), false) => {
+                self.view.deleted = self.view.deleted.next();
+                self.reload = true;
+            }
             (Some(_), _, _) => {}
 
-            (None, KeyCode::Char(c @ ('g' | 'z')), false) => {
+            (None, KeyCode::Char(c @ ('g' | 'z' | 's')), false) => {
                 self.prefix = Some(c);
                 self.count = count;
             }
@@ -477,8 +483,9 @@ impl App {
                     if self.cursor >= self.len() {
                         break;
                     }
-                    if !self.marks.remove(&self.cursor) {
-                        self.marks.insert(self.cursor);
+                    match self.marks.iter().position(|&r| r == self.cursor) {
+                        Some(i) => _ = self.marks.remove(i),
+                        None => self.marks.push(self.cursor),
                     }
                     self.cursor += 1;
                 }
@@ -486,7 +493,11 @@ impl App {
             }
             (None, KeyCode::Char('v'), false) => match self.visual.take() {
                 Some(anchor) => {
-                    self.marks.extend(anchor.min(self.cursor)..=anchor.max(self.cursor))
+                    for row in self.visual_rows(anchor) {
+                        if !self.marks.contains(&row) {
+                            self.marks.push(row);
+                        }
+                    }
                 }
                 None if self.len() > 0 => self.visual = Some(self.cursor),
                 None => {}
@@ -542,10 +553,7 @@ impl App {
                 self.view.hiding = !self.view.hiding;
                 self.reload = true;
             }
-            (None, KeyCode::Char('d'), false) => {
-                self.view.deleted = self.view.deleted.next();
-                self.reload = true;
-            }
+            (None, KeyCode::Char('d'), false) => self.diff_selected(),
             _ => {}
         }
         self.clamp();
@@ -739,12 +747,33 @@ impl App {
         self.head_to_top = true;
     }
 
-    /// The rows an action applies to: the visual range, else the marks, else the cursor row.
+    /// The visual range from `anchor` to the cursor, in that order.
+    fn visual_rows(&self, anchor: usize) -> Vec<usize> {
+        if anchor <= self.cursor {
+            (anchor..=self.cursor).collect()
+        } else {
+            (self.cursor..=anchor).rev().collect()
+        }
+    }
+
+    /// The rows an action applies to, in the order they were selected: the visual range from
+    /// where it started, else the marks, else the cursor row.
     fn selection(&self) -> Vec<usize> {
         match self.visual {
-            Some(a) => (a.min(self.cursor)..=a.max(self.cursor)).collect(),
-            None if !self.marks.is_empty() => self.marks.iter().copied().collect(),
+            Some(a) => self.visual_rows(a),
+            None if !self.marks.is_empty() => self.marks.clone(),
             None => vec![self.cursor],
+        }
+    }
+
+    /// `d`: with exactly two commits selected, diffs from the second selected to the first.
+    fn diff_selected(&mut self) {
+        let rows = self.selection();
+        let oids: Vec<_> = rows.iter().filter_map(|&r| self.history.commits.get(r)).map(|c| c.oid).collect();
+        match (oids.as_slice(), self.visual.is_some() || !self.marks.is_empty()) {
+            ([first, second], true) => self.command = Some(Command::Diff(*second, *first)),
+            (_, true) => self.message = Some(format!("d diffs two selected commits; {} are selected", oids.len())),
+            (_, false) => self.message = Some("d diffs two selected commits: mark them with Space".into()),
         }
     }
 
@@ -895,9 +924,9 @@ mod tests {
         keys(&mut a, " ");
         assert_eq!(a.cursor, 1);
         keys(&mut a, "2 ");
-        assert_eq!(a.marks.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(a.marks, vec![0, 1, 2]);
         keys(&mut a, "kk ");
-        assert_eq!(a.marks.iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(a.marks, vec![0, 2]);
         keys(&mut a, "10Gv3k");
         assert!(a.is_selected(7) && a.is_selected(9) && !a.is_selected(10));
         keys(&mut a, "v");
@@ -912,7 +941,7 @@ mod tests {
         let mut a = app(20, 10);
         keys(&mut a, "3G 3j ");
         let before = (a.cursor, a.offset, a.marks.clone());
-        assert_eq!(before.2.iter().copied().collect::<Vec<_>>(), vec![2, 6]);
+        assert_eq!(before.2, vec![2, 6]);
 
         // A new commit on top pushes everything down one row.
         let mut ids = vec![100u8];
@@ -920,12 +949,12 @@ mod tests {
         a.replace(history(&ids));
         assert_eq!(a.cursor, before.0 + 1);
         assert_eq!(a.offset, before.1, "the view stays at the top");
-        assert_eq!(a.marks.iter().copied().collect::<Vec<_>>(), vec![3, 7]);
+        assert_eq!(a.marks, vec![3, 7]);
 
         // The marked commit 2 is gone; the other mark moves up with the rows.
         let ids: Vec<u8> = (0..20u8).filter(|&i| i != 2).collect();
         a.replace(history(&ids));
-        assert_eq!(a.marks.iter().copied().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(a.marks, vec![5]);
         assert_eq!(a.cursor, 6);
 
         // Scrolled down, the cursor keeps its screen row instead.
@@ -1225,6 +1254,29 @@ mod tests {
         assert_eq!((a.total(), a.head_row), (5, Some(0)));
         keys(&mut a, "a");
         assert_eq!(a.len(), 5);
+    }
+
+    #[test]
+    fn sd_cycles_deleted_and_d_diffs_against_selection_order() {
+        let mut a = app(20, 10);
+        keys(&mut a, "sd");
+        assert_eq!((a.view.deleted, a.reload), (repo::Deleted::Reflog, true));
+        let oid = |a: &App, r: usize| a.history.commits[r].oid;
+
+        keys(&mut a, "d");
+        assert_eq!(a.command, None, "nothing selected");
+        // Marked 8, then 3: the diff goes from 3 to 8.
+        keys(&mut a, "8G 3G d");
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 2), oid(&a, 7))));
+        assert_eq!(a.marks, vec![7, 2]);
+        // A third mark: no diff.
+        keys(&mut a, "5G d");
+        assert_eq!(a.command, None);
+        assert!(a.message.is_some());
+
+        // A visual range of two goes to where it started.
+        keys(&mut a, "U6Gvkd");
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 4), oid(&a, 5))));
     }
 
     #[test]

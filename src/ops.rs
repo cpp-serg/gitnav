@@ -84,19 +84,31 @@ pub fn pull(path: &Path) -> Result<PullOutcome> {
 /// `git show` of one commit as text, passed through the pager git would use for it (delta,
 /// say), with its colours. `width` is the room it gets, for pagers that lay out by width.
 pub fn show(path: &Path, oid: git2::Oid, width: usize) -> Result<String> {
-    let dir = workdir_or_gitdir(path)?;
-    let pager = configured_pager(&dir).and_then(|p| filter_pager(&p, width));
-    show_through(&dir, oid, width, pager.as_deref())
+    colored(path, &["show".into(), oid.to_string()], width)
 }
 
-/// `git show` in `dir`, piped through `pager` if there is one.
-fn show_through(dir: &Path, oid: git2::Oid, width: usize, pager: Option<&str>) -> Result<String> {
+/// `git diff from to` as text, passed through the pager as `show` does.
+pub fn diff(path: &Path, from: git2::Oid, to: git2::Oid, width: usize) -> Result<String> {
+    colored(path, &["diff".into(), from.to_string(), to.to_string()], width)
+}
+
+/// The output of the git command `args` (`args[0]` names it), coloured and passed through the
+/// pager git would use for that command.
+fn colored(path: &Path, args: &[String], width: usize) -> Result<String> {
+    let dir = workdir_or_gitdir(path)?;
+    let pager = configured_pager(&dir, &args[0]).and_then(|p| filter_pager(&p, width));
+    run_through(&dir, args, width, pager.as_deref())
+}
+
+/// The git command `args` in `dir`, piped through `pager` if there is one.
+fn run_through(dir: &Path, args: &[String], width: usize, pager: Option<&str>) -> Result<String> {
+    let name = format!("git {}", args[0]);
     let mut git = Command::new("git");
-    git.args(["--no-pager", "show", "--color=always"]).arg(oid.to_string()).current_dir(dir);
+    git.args(["--no-pager", &args[0], "--color=always"]).args(&args[1..]).current_dir(dir);
     let Some(pager) = pager else {
-        let out = git.stdin(Stdio::null()).output().context("running git show")?;
+        let out = git.stdin(Stdio::null()).output().with_context(|| format!("running {name}"))?;
         if !out.status.success() {
-            bail!("git show failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!("{name} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     };
@@ -106,7 +118,7 @@ fn show_through(dir: &Path, oid: git2::Oid, width: usize, pager: Option<&str>) -
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("running git show")?;
+        .with_context(|| format!("running {name}"))?;
     // Run the way git runs its pager: through the shell, with git's defaults for less and lv.
     let out = Command::new("sh")
         .args(["-c", pager])
@@ -117,9 +129,9 @@ fn show_through(dir: &Path, oid: git2::Oid, width: usize, pager: Option<&str>) -
         .stdin(show.stdout.take().expect("piped"))
         .output()
         .with_context(|| format!("running the pager: {pager}"))?;
-    let shown = show.wait_with_output().context("running git show")?;
+    let shown = show.wait_with_output().with_context(|| format!("running {name}"))?;
     if !shown.status.success() {
-        bail!("git show failed: {}", String::from_utf8_lossy(&shown.stderr).trim());
+        bail!("{name} failed: {}", String::from_utf8_lossy(&shown.stderr).trim());
     }
     if !out.status.success() {
         bail!("the pager ({pager}) failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -127,14 +139,15 @@ fn show_through(dir: &Path, oid: git2::Oid, width: usize, pager: Option<&str>) -
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The pager git would use for `git show` in `dir`: `pager.show` if it names one (none if it
-/// is false), else `git var GIT_PAGER` ($GIT_PAGER, core.pager, $PAGER, git's default).
-fn configured_pager(dir: &Path) -> Option<String> {
+/// The pager git would use for `git <command>` in `dir`: `pager.<command>` if it names one
+/// (none if it is false), else `git var GIT_PAGER` ($GIT_PAGER, core.pager, $PAGER, git's
+/// default).
+fn configured_pager(dir: &Path, command: &str) -> Option<String> {
     let git = |args: &[&str]| {
         let out = Command::new("git").args(args).current_dir(dir).stdin(Stdio::null()).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    match git(&["config", "--type=bool-or-str", "--get", "pager.show"]).as_deref() {
+    match git(&["config", "--type=bool-or-str", "--get", &format!("pager.{command}")]).as_deref() {
         Some("false") => None,
         Some("true") | None => git(&["var", "GIT_PAGER"]),
         Some(own) => Some(own.to_string()),
@@ -269,21 +282,43 @@ mod tests {
         let (_tmp, mine, _theirs) = setup();
         let head = Repository::open(&mine).unwrap().head().unwrap().target().unwrap();
         // The text as git shows it, without a pager and without the colour codes.
-        let text: String = crate::ansi::to_lines(&show_through(&mine, head, 100, None).unwrap())
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n")
-            .collect();
+        let text = plain(&run_through(&mine, &["show".into(), head.to_string()], 100, None).unwrap());
         assert!(text.contains(&format!("commit {head}")), "{text}");
         assert!(text.contains("\n+base\n"), "{text}");
+    }
+
+    /// Text with git's colour codes taken out.
+    fn plain(text: &str) -> String {
+        crate::ansi::to_lines(text)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn diff_goes_from_the_first_to_the_second() {
+        let (_tmp, mine, _theirs) = setup();
+        let rev = |r: &str| git2::Oid::from_str(git(&mine, &["rev-parse", r]).trim()).unwrap();
+        let old = rev("HEAD");
+        std::fs::write(mine.join("added"), "new line\n").unwrap();
+        git(&mine, &["add", "added"]);
+        git(&mine, &["commit", "-q", "-m", "add"]);
+        let new = rev("HEAD");
+        let run = |a: git2::Oid, b: git2::Oid| {
+            plain(&run_through(&mine, &["diff".into(), a.to_string(), b.to_string()], 100, None).unwrap())
+        };
+        assert!(run(old, new).contains("\n+new line\n"));
+        assert!(run(new, old).contains("\n-new line\n"));
     }
 
     #[test]
     fn show_through_a_pager() {
         let (_tmp, mine, _theirs) = setup();
         let head = Repository::open(&mine).unwrap().head().unwrap().target().unwrap();
-        let text = show_through(&mine, head, 100, Some("sed s/^/X/")).unwrap();
+        let args = ["show".to_string(), head.to_string()];
+        let text = run_through(&mine, &args, 100, Some("sed s/^/X/")).unwrap();
         assert!(!text.is_empty() && text.lines().all(|l| l.starts_with('X')), "{text}");
-        assert!(show_through(&mine, head, 100, Some("false")).is_err(), "a failing pager is reported");
+        assert!(run_through(&mine, &args, 100, Some("false")).is_err(), "a failing pager is reported");
     }
 
     #[test]
@@ -301,9 +336,11 @@ mod tests {
     fn pager_show_false_means_none() {
         let (_tmp, mine, _theirs) = setup();
         git(&mine, &["config", "pager.show", "false"]);
-        assert_eq!(configured_pager(&mine), None);
+        assert_eq!(configured_pager(&mine, "show"), None);
         git(&mine, &["config", "pager.show", "tac"]);
-        assert_eq!(configured_pager(&mine).as_deref(), Some("tac"));
+        assert_eq!(configured_pager(&mine, "show").as_deref(), Some("tac"));
+        git(&mine, &["config", "pager.diff", "rev"]);
+        assert_eq!(configured_pager(&mine, "diff").as_deref(), Some("rev"));
     }
 
     #[test]

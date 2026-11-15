@@ -144,6 +144,14 @@ fn run_command(
             }
             Err(e) => app.message = Some(format!("{e:#}")),
         },
+        Command::Diff(from, to) => match ops::diff(path, from, to, app.width) {
+            Ok(text) if text.trim().is_empty() => app.message = Some("no differences".into()),
+            Ok(text) => {
+                let title = format!("git diff {} {}", &from.to_string()[..7], &to.to_string()[..7]);
+                app.pager = Some(app::Pager::new(title, ansi::to_lines(&text)));
+            }
+            Err(e) => app.message = Some(format!("{e:#}")),
+        },
         Command::AbortRebase => {
             app.message = Some(match ops::abort_rebase(path) {
                 Ok(()) => "rebase aborted".into(),

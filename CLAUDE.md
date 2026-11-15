@@ -78,7 +78,8 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
 - **`ops.rs`** is the only place that runs the git CLI at runtime: pull with autostash and
   rebase, and rebase abort (libgit2 has no equivalent with git's credential handling; `main.rs`
   leaves the alternate screen while they run so git can prompt), and `git show` for the commit
-  view (Enter), whose colours `ansi.rs` turns into styled lines for `app::Pager`.
+  view (Enter) and `git diff` of two selected commits, from the second selected to the first
+  (d), whose colours `ansi.rs` turns into styled lines for `app::Pager`.
 - **`config.rs`**: settings come from the config file
   (`$XDG_CONFIG_HOME/gitnav/config.toml`), then `$GITNAV_OPTS`, then the command line, later
   winning (`--hide` patterns add up). A new option needs a `--x`/`--no-x` pair in `Cli`, a
