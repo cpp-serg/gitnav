@@ -77,9 +77,12 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   the hash) is inserted after highlighting with `insert_at`.
 - **`ops.rs`** is the only place that runs the git CLI at runtime: pull with autostash and
   rebase, and rebase abort (libgit2 has no equivalent with git's credential handling; `main.rs`
-  leaves the alternate screen while they run so git can prompt), and `git show` for the commit
+  leaves the alternate screen while they run so git can prompt), `git show` for the commit
   view (Enter) and `git diff` of two selected commits, from the second selected to the first
-  (d), whose colours `ansi.rs` turns into styled lines for `app::Pager`.
+  (d), whose colours `ansi.rs` turns into styled lines for `app::Pager`, and deleting branches
+  and tags locally and on remotes (Delete). Anything that talks to a remote while the TUI owns
+  the terminal goes through `ops::batch`, which stops git and ssh from prompting; pushes run
+  outside the TUI instead.
 - **`config.rs`**: settings come from the config file
   (`$XDG_CONFIG_HOME/gitnav/config.toml`), then `$GITNAV_OPTS`, then the command line, later
   winning (`--hide` patterns add up). A new option needs a `--x`/`--no-x` pair in `Cli`, a

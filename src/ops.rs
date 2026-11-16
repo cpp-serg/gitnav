@@ -1,5 +1,6 @@
 //! Operations that run the git CLI: pull and rebase (libgit2 has no pull, no rebase with
-//! autostash, and does not use git's credential helpers or ssh setup), and `git show`.
+//! autostash, and does not use git's credential helpers or ssh setup), `git show`, and
+//! deleting branches and tags, locally and on remotes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -187,6 +188,189 @@ pub fn abort_rebase(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A named ref that can be deleted, here or on a remote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Deletion {
+    LocalBranch(String),
+    /// The branch on the remote (and with it the remote-tracking ref `remote/branch`).
+    RemoteBranch { remote: String, branch: String },
+    LocalTag(String),
+    RemoteTag { remote: String, tag: String },
+}
+
+impl Deletion {
+    /// What to call it in the dialog: kind and name.
+    pub fn label(&self) -> (&'static str, String) {
+        match self {
+            Deletion::LocalBranch(b) => ("branch", b.clone()),
+            Deletion::RemoteBranch { remote, branch } => ("remote branch", format!("{remote}/{branch}")),
+            Deletion::LocalTag(t) => ("tag", t.clone()),
+            Deletion::RemoteTag { remote, tag } => ("remote tag", format!("{tag} on {remote}")),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Deletion::RemoteBranch { .. } | Deletion::RemoteTag { .. })
+    }
+
+    /// The name it sorts by, so that a branch or tag and its remote copies stay together.
+    fn name(&self) -> &str {
+        match self {
+            Deletion::LocalBranch(n) | Deletion::LocalTag(n) => n,
+            Deletion::RemoteBranch { branch: n, .. } | Deletion::RemoteTag { tag: n, .. } => n,
+        }
+    }
+}
+
+/// What can be deleted at a commit: each with a warning, if any; plus notes on what cannot be
+/// (the checked-out branch) or could not be checked (a remote that did not answer).
+pub struct Deletables {
+    pub entries: Vec<(Deletion, Option<String>)>,
+    pub notes: Vec<String>,
+}
+
+/// The branches and tags pointing at `oid`, their remote-tracking branches, and the same tags
+/// on each remote (asked with `git ls-remote`, which must not prompt: see `batch`).
+pub fn deletables(path: &Path, oid: git2::Oid) -> Result<Deletables> {
+    let repo = Repository::discover(path)?;
+    let dir = workdir_or_gitdir(path)?;
+    let head = repo.head().ok().and_then(|h| h.target());
+    let current = repo
+        .find_reference("HEAD")
+        .ok()
+        .and_then(|h| h.symbolic_target_bytes().map(|t| String::from_utf8_lossy(t).into_owned()));
+    let mut entries = Vec::new();
+    let mut notes = Vec::new();
+    let mut tags = Vec::new();
+    // remote/HEAD names each remote's default branch.
+    let defaults: Vec<String> = repo
+        .references_glob("refs/remotes/*/HEAD")?
+        .flatten()
+        .filter_map(|r| r.symbolic_target_bytes().map(|t| String::from_utf8_lossy(t).into_owned()))
+        .collect();
+    for reference in repo.references()? {
+        let reference = reference?;
+        let name = String::from_utf8_lossy(reference.name_bytes()).into_owned();
+        if reference.peel_to_commit().map(|c| c.id()).ok() != Some(oid) {
+            continue;
+        }
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            if current.as_deref() == Some(name.as_str()) {
+                notes.push(format!("{branch} is checked out; switch to another branch to delete it"));
+                continue;
+            }
+            let merged = head.is_some_and(|h| h == oid || repo.graph_descendant_of(h, oid).unwrap_or(false));
+            let warning = (!merged).then(|| "not merged into HEAD".to_string());
+            entries.push((Deletion::LocalBranch(branch.to_string()), warning));
+        } else if let Some(rest) = name.strip_prefix("refs/remotes/") {
+            // remote/HEAD only says which branch is the remote's default.
+            if reference.symbolic_target_bytes().is_some() {
+                continue;
+            }
+            let Some((remote, branch)) = split_remote(&repo, rest) else { continue };
+            let warning = defaults.contains(&name).then(|| format!("the default branch on {remote}"));
+            entries.push((Deletion::RemoteBranch { remote, branch }, warning));
+        } else if let Some(tag) = name.strip_prefix("refs/tags/") {
+            entries.push((Deletion::LocalTag(tag.to_string()), None));
+            tags.push(tag.to_string());
+        }
+    }
+    if !tags.is_empty() {
+        for remote in remote_names(&repo) {
+            match remote_tags(&dir, &remote, &tags) {
+                Ok(found) => entries.extend(
+                    found.into_iter().map(|tag| (Deletion::RemoteTag { remote: remote.clone(), tag }, None)),
+                ),
+                Err(e) => notes.push(format!("could not check {remote} for these tags: {e:#}")),
+            }
+        }
+    }
+    entries.sort_by(|(a, _), (b, _)| (a.name(), a.is_remote(), a.label()).cmp(&(b.name(), b.is_remote(), b.label())));
+    Ok(Deletables { entries, notes })
+}
+
+/// Splits `origin/feature/x` into the remote and the branch, by the remotes configured
+/// (a remote's name may itself contain a slash).
+fn split_remote(repo: &Repository, rest: &str) -> Option<(String, String)> {
+    let remote = remote_names(repo)
+        .into_iter()
+        .filter(|r| rest.starts_with(&format!("{r}/")))
+        .max_by_key(String::len)?;
+    let branch = rest[remote.len() + 1..].to_string();
+    Some((remote, branch))
+}
+
+fn remote_names(repo: &Repository) -> Vec<String> {
+    let Ok(remotes) = repo.remotes() else { return Vec::new() };
+    remotes.iter().filter_map(|r| r.ok().flatten().map(str::to_owned)).collect()
+}
+
+/// Which of `tags` the remote has.
+fn remote_tags(dir: &Path, remote: &str, tags: &[String]) -> Result<Vec<String>> {
+    let mut cmd = batch(dir);
+    cmd.args(["ls-remote", "--tags", remote]).args(tags.iter().map(|t| format!("refs/tags/{t}")));
+    let out = cmd.output().context("running git ls-remote")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let listed = String::from_utf8_lossy(&out.stdout);
+    Ok(tags
+        .iter()
+        .filter(|t| listed.lines().any(|l| l.split('\t').nth(1) == Some(&format!("refs/tags/{t}"))))
+        .cloned()
+        .collect())
+}
+
+/// git for a remote operation that must not stop to ask anything (it runs while the TUI owns
+/// the terminal): no credential prompts, and ssh in batch mode unless ssh is set up otherwise.
+fn batch(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
+    let ssh_configured = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || Command::new("git")
+            .args(["config", "--get", "core.sshCommand"])
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success());
+    if !ssh_configured {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=5");
+    }
+    cmd
+}
+
+/// Deletes one ref and says what happened. Remote deletions are pushes, which may ask for a
+/// passphrase: run them with the terminal handed to git.
+pub fn delete(path: &Path, what: &Deletion) -> Result<String> {
+    let dir = workdir_or_gitdir(path)?;
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        Command::new("git").args(args).current_dir(&dir).stdin(Stdio::null()).output().context("running git")
+    };
+    let failed = |out: &std::process::Output| String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let (label, name) = what.label();
+    let out = match what {
+        Deletion::LocalBranch(b) => run(&["branch", "-D", b])?,
+        Deletion::LocalTag(t) => run(&["tag", "-d", t])?,
+        Deletion::RemoteTag { remote, tag } => run(&["push", remote, "--delete", &format!("refs/tags/{tag}")])?,
+        Deletion::RemoteBranch { remote, branch } => {
+            let out = run(&["push", remote, "--delete", branch])?;
+            if !out.status.success() && failed(&out).contains("remote ref does not exist") {
+                // Already gone there: only the stale remote-tracking ref is left.
+                let local = run(&["branch", "-d", "-r", &format!("{remote}/{branch}")])?;
+                if !local.status.success() {
+                    bail!("deleting {label} {name}: {}", failed(&local));
+                }
+                return Ok(format!("{remote}/{branch} was already gone on {remote}; removed the stale ref"));
+            }
+            out
+        }
+    };
+    if !out.status.success() {
+        bail!("deleting {label} {name}: {}", failed(&out));
+    }
+    Ok(format!("deleted {label} {name}"))
+}
+
 fn head(dir: &Path) -> Option<git2::Oid> {
     Repository::open(dir).ok()?.head().ok()?.target()
 }
@@ -341,6 +525,68 @@ mod tests {
         assert_eq!(configured_pager(&mine, "show").as_deref(), Some("tac"));
         git(&mine, &["config", "pager.diff", "rev"]);
         assert_eq!(configured_pager(&mine, "diff").as_deref(), Some("rev"));
+    }
+
+    #[test]
+    fn delete_branches_and_tags_here_and_on_the_remote() {
+        let (tmp, mine, _theirs) = setup();
+        let up = tmp.path().join("up.git");
+        let head = Repository::open(&mine).unwrap().head().unwrap().target().unwrap();
+        // At HEAD: the branch feat (also on origin), the tags v1 (also on origin) and v2.
+        git(&mine, &["branch", "feat"]);
+        git(&mine, &["push", "-q", "origin", "feat"]);
+        git(&mine, &["tag", "v1"]);
+        git(&mine, &["push", "-q", "origin", "v1"]);
+        git(&mine, &["tag", "v2"]);
+        // A branch HEAD does not contain, elsewhere.
+        git(&mine, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(mine.join("s"), "s").unwrap();
+        git(&mine, &["add", "s"]);
+        git(&mine, &["commit", "-q", "-m", "side"]);
+        git(&mine, &["checkout", "-q", "main"]);
+        // Cloned while the upstream was empty, so origin/HEAD was never set.
+        git(&mine, &["remote", "set-head", "origin", "main"]);
+
+        let d = deletables(&mine, head).unwrap();
+        let labels: Vec<String> = d.entries.iter().map(|(e, _)| format!("{} {}", e.label().0, e.label().1)).collect();
+        assert_eq!(
+            labels,
+            [
+                "branch feat",
+                "remote branch origin/feat",
+                "remote branch origin/main",
+                "tag v1",
+                "remote tag v1 on origin",
+                "tag v2",
+            ]
+        );
+        let warnings: Vec<_> = d.entries.iter().filter_map(|(e, w)| Some((e.label().1, w.clone()?))).collect();
+        assert_eq!(warnings, [("origin/main".to_string(), "the default branch on origin".to_string())]);
+        assert!(d.notes.iter().any(|n| n.starts_with("main is checked out")), "{:?}", d.notes);
+
+        let side = Repository::open(&mine).unwrap().revparse_single("side").unwrap().id();
+        let d = deletables(&mine, side).unwrap();
+        assert_eq!(d.entries, [(Deletion::LocalBranch("side".into()), Some("not merged into HEAD".into()))]);
+
+        for what in [
+            Deletion::LocalBranch("feat".into()),
+            Deletion::RemoteBranch { remote: "origin".into(), branch: "feat".into() },
+            Deletion::LocalTag("v1".into()),
+            Deletion::RemoteTag { remote: "origin".into(), tag: "v1".into() },
+        ] {
+            delete(&mine, &what).unwrap();
+        }
+        let local = git(&mine, &["for-each-ref", "--format=%(refname)"]);
+        assert!(!local.contains("refs/heads/feat") && !local.contains("refs/remotes/origin/feat"), "{local}");
+        assert!(!local.contains("refs/tags/v1") && local.contains("refs/tags/v2"), "{local}");
+        let remote = git(&up, &["for-each-ref", "--format=%(refname)"]);
+        assert!(!remote.contains("refs/heads/feat") && !remote.contains("refs/tags/v1"), "{remote}");
+
+        // A remote-tracking ref whose branch is gone on the remote is only removed here.
+        git(&mine, &["update-ref", "refs/remotes/origin/gone", "HEAD"]);
+        let said = delete(&mine, &Deletion::RemoteBranch { remote: "origin".into(), branch: "gone".into() }).unwrap();
+        assert!(said.contains("already gone"), "{said}");
+        assert!(!git(&mine, &["for-each-ref"]).contains("origin/gone"));
     }
 
     #[test]

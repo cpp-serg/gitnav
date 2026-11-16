@@ -4,6 +4,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::graph;
 use crate::matcher::{self, Mode};
+use crate::ops::Deletion;
 use crate::repo::{self, History, View};
 
 /// Columns moved by one `h` or `l`.
@@ -25,6 +26,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("h l  ← →", "scroll sideways"),
     ("0", "scroll back to the left edge"),
     ("Enter", "show the commit (git show); j k, Ctrl-d Ctrl-u, Space, gg G scroll; q Esc Enter close"),
+    ("Delete", "delete branches and tags at the commit, here or on remotes: a checklist"),
     ("d", "diff two selected commits: git diff <second selected> <first selected>"),
     ("", "Selecting"),
     ("Space", "mark or unmark the commit, move down (marks keep the order they were made in)"),
@@ -64,6 +66,28 @@ pub enum Command {
     Show(git2::Oid),
     /// The diff between two commits, in the order they were selected (`git diff a b`).
     Diff(git2::Oid, git2::Oid),
+    /// Find the branches and tags at a commit that could be deleted, and ask which.
+    FindDeletables(git2::Oid),
+    /// Delete what the delete dialog chose (`App::deletions`).
+    Delete,
+}
+
+/// The checklist of branches and tags to delete at a commit.
+pub struct DeleteDialog {
+    /// The commit's short hash, for the title.
+    pub short: String,
+    /// What can be deleted, why to think twice (if anything), and whether it is ticked.
+    pub entries: Vec<(Deletion, Option<String>, bool)>,
+    /// What cannot be deleted, or could not be checked.
+    pub notes: Vec<String>,
+    pub cursor: usize,
+}
+
+impl DeleteDialog {
+    pub fn new(short: String, found: crate::ops::Deletables) -> Self {
+        let entries = found.entries.into_iter().map(|(d, w)| (d, w, false)).collect();
+        DeleteDialog { short, entries, notes: found.notes, cursor: 0 }
+    }
 }
 
 /// A scrollable text view over the graph, such as a commit's `git show`.
@@ -192,6 +216,10 @@ pub struct App {
     pub help: Option<usize>,
     /// A commit's contents shown over the graph (Enter).
     pub pager: Option<Pager>,
+    /// The delete checklist (Delete).
+    pub delete: Option<DeleteDialog>,
+    /// What the delete checklist chose, for `Command::Delete`.
+    pub deletions: Vec<Deletion>,
     pub quit: bool,
 }
 
@@ -229,6 +257,8 @@ impl App {
             last_query: Default::default(),
             help: None,
             pager: None,
+            delete: None,
+            deletions: Vec::new(),
             quit: false,
         };
         app.relayout();
@@ -368,6 +398,12 @@ impl App {
             {
                 self.command = command;
                 self.dialog = None;
+            }
+            return;
+        }
+        if let Some(mut dialog) = self.delete.take() {
+            if self.delete_key(&mut dialog, key) {
+                self.delete = Some(dialog);
             }
             return;
         }
@@ -529,6 +565,11 @@ impl App {
             (None, KeyCode::Char('R'), false) => self.reload = true,
             (None, KeyCode::Char('@'), false) => self.set_head(),
             (None, KeyCode::Char('p'), false) => self.command = Some(Command::Pull),
+            (None, KeyCode::Delete, false) => {
+                if let Some(c) = self.history.commits.get(self.cursor) {
+                    self.command = Some(Command::FindDeletables(c.oid));
+                }
+            }
             (None, KeyCode::Enter, false) => {
                 if let Some(c) = self.history.commits.get(self.cursor) {
                     self.command = Some(Command::Show(c.oid));
@@ -557,6 +598,38 @@ impl App {
             _ => {}
         }
         self.clamp();
+    }
+
+    /// A key while the delete checklist is open; false when it closes. Enter with something
+    /// ticked hands the ticked entries to `Command::Delete`.
+    fn delete_key(&mut self, d: &mut DeleteDialog, key: KeyEvent) -> bool {
+        let last = d.entries.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return false,
+            KeyCode::Char('j') | KeyCode::Down => d.cursor = (d.cursor + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => d.cursor = d.cursor.saturating_sub(1),
+            KeyCode::Char(' ') => {
+                if let Some(entry) = d.entries.get_mut(d.cursor) {
+                    entry.2 = !entry.2;
+                }
+            }
+            KeyCode::Char('a') => {
+                let all = d.entries.iter().all(|e| e.2);
+                d.entries.iter_mut().for_each(|e| e.2 = !all);
+            }
+            KeyCode::Enter => {
+                let chosen: Vec<Deletion> = d.entries.iter().filter(|e| e.2).map(|e| e.0.clone()).collect();
+                if chosen.is_empty() {
+                    self.message = Some("nothing ticked: Space ticks, Esc cancels".into());
+                    return true;
+                }
+                self.deletions = chosen;
+                self.command = Some(Command::Delete);
+                return false;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// A key while the pager is open; false when it closes the pager.
@@ -1297,5 +1370,38 @@ mod tests {
         assert_eq!(a.pager.as_ref().unwrap().scroll, 0);
         keys(&mut a, "q");
         assert!(a.pager.is_none() && !a.quit);
+    }
+
+    #[test]
+    fn delete_checklist() {
+        use crate::ops::Deletables;
+        let mut a = app(5, 10);
+        keys(&mut a, "2G");
+        special(&mut a, KeyCode::Delete);
+        assert_eq!(a.command.take(), Some(Command::FindDeletables(a.history.commits[1].oid)));
+
+        let found = Deletables {
+            entries: vec![
+                (Deletion::LocalBranch("feat".into()), None),
+                (Deletion::RemoteBranch { remote: "origin".into(), branch: "feat".into() }, None),
+                (Deletion::LocalTag("v1".into()), None),
+            ],
+            notes: vec![],
+        };
+        a.delete = Some(DeleteDialog::new("0101010".into(), found));
+        special(&mut a, KeyCode::Enter);
+        assert!(a.delete.is_some() && a.command.is_none(), "nothing ticked yet");
+        keys(&mut a, " jj ");
+        assert_eq!(a.cursor, 1, "the graph does not move under the dialog");
+        special(&mut a, KeyCode::Enter);
+        assert!(a.delete.is_none());
+        assert_eq!(a.command, Some(Command::Delete));
+        assert_eq!(a.deletions, [Deletion::LocalBranch("feat".into()), Deletion::LocalTag("v1".into())]);
+
+        a.delete = Some(DeleteDialog::new("0101010".into(), Deletables { entries: vec![(Deletion::LocalTag("v1".into()), None)], notes: vec![] }));
+        keys(&mut a, "a");
+        assert!(a.delete.as_ref().unwrap().entries[0].2, "a ticks all");
+        keys(&mut a, "q");
+        assert!(a.delete.is_none() && !a.quit, "q only closes the dialog");
     }
 }

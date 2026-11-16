@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{App, Dialog, HELP, Prompt, PromptKind};
+use crate::app::{App, DeleteDialog, Dialog, HELP, Prompt, PromptKind};
 use crate::matcher;
 
 /// Lane colours, in the order git cycles through them.
@@ -112,6 +112,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(dialog) = &app.dialog {
         draw_dialog(frame, dialog);
     }
+    if let Some(dialog) = &app.delete {
+        draw_delete(frame, dialog);
+    }
 }
 
 /// The key list in a bordered popup over the commits, scrolled when it does not fit.
@@ -151,6 +154,49 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         Paragraph::new(lines).block(block).scroll((scroll as u16, 0)),
         popup,
     );
+}
+
+/// The delete checklist: one line per branch or tag, ticked or not, with the cursor on one.
+fn draw_delete(frame: &mut Frame, dialog: &DeleteDialog) {
+    let kind_width = dialog.entries.iter().map(|(d, _, _)| d.label().0.len()).max().unwrap_or(0);
+    let name_width = dialog.entries.iter().map(|(d, _, _)| d.label().1.chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (what, warning, ticked)) in dialog.entries.iter().enumerate() {
+        let (kind, name) = what.label();
+        let mut spans = vec![
+            Span::raw(if *ticked { " [x] " } else { " [ ] " }),
+            Span::styled(format!("{kind:<kind_width$}  "), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{name:<name_width$}"), Style::new().add_modifier(Modifier::BOLD)),
+        ];
+        if let Some(warning) = warning {
+            spans.push(Span::styled(format!("  {warning}"), Style::new().fg(Color::Yellow)));
+        }
+        let mut line = Line::from(spans);
+        if i == dialog.cursor {
+            line = line.style(Style::new().bg(CURSOR_BG));
+        }
+        lines.push(line);
+    }
+    if !dialog.notes.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(dialog.notes.iter().map(|n| Line::styled(format!(" {n}"), Style::new().fg(Color::Gray))));
+    }
+    let hint = " Space tick  a all  Enter delete  Esc cancel ";
+    let width = lines.iter().map(Line::width).chain([hint.len() + 2]).max().unwrap_or(0) as u16 + 4;
+    let area = frame.area();
+    let height = lines.len() as u16 + 2;
+    let popup = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+    let block = Block::bordered()
+        .title(format!(" Delete at {} ", dialog.short))
+        .title_bottom(Line::from(hint).right_aligned())
+        .border_style(Style::new().fg(Color::LightRed));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn draw_dialog(frame: &mut Frame, dialog: &Dialog) {

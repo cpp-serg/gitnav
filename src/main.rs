@@ -137,6 +137,64 @@ fn run_command(
             }
             reload(app, path, &app.message.clone().unwrap_or_default());
         }
+        Command::FindDeletables(oid) => {
+            let short = oid.to_string()[..7].to_string();
+            // Asking the remotes about tags can take a moment: say so first.
+            app.message = Some(format!("looking for branches and tags at {short}…"));
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            app.message = None;
+            match ops::deletables(path, oid) {
+                Ok(found) if found.entries.is_empty() && found.notes.is_empty() => {
+                    app.message = Some(format!("no branches or tags at {short}"));
+                }
+                Ok(found) if found.entries.is_empty() => {
+                    app.dialog = Some(Dialog {
+                        title: format!("Nothing to delete at {short}"),
+                        lines: found.notes,
+                        choices: vec![('o', "ok", None)],
+                    });
+                }
+                Ok(found) => app.delete = Some(app::DeleteDialog::new(short, found)),
+                Err(e) => app.message = Some(format!("{e:#}")),
+            }
+        }
+        Command::Delete => {
+            let chosen = std::mem::take(&mut app.deletions);
+            let run = |what: &ops::Deletion| ops::delete(path, what);
+            let results: Vec<_> = if chosen.iter().any(ops::Deletion::is_remote) {
+                // Deleting on a remote is a push, which may ask for a passphrase.
+                outside_tui(terminal, || {
+                    let results: Vec<_> = chosen
+                        .iter()
+                        .map(|what| {
+                            let (kind, name) = what.label();
+                            println!("gitnav: deleting {kind} {name}");
+                            let result = run(what);
+                            match &result {
+                                Ok(said) => println!("  {said}"),
+                                Err(e) => println!("  {e:#}"),
+                            }
+                            result
+                        })
+                        .collect();
+                    if results.iter().any(Result::is_err) {
+                        print!("\ngitnav: press Enter to go back");
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stdin().read_line(&mut String::new());
+                    }
+                    results
+                })?
+            } else {
+                chosen.iter().map(run).collect()
+            };
+            let failed: Vec<String> = results.iter().filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}"))).collect();
+            let done = results.len() - failed.len();
+            let note = match failed.first() {
+                None => format!("deleted {done} of {}", results.len()),
+                Some(first) => format!("deleted {done} of {}; {first}", results.len()),
+            };
+            reload(app, path, &note);
+        }
         Command::Show(oid) => match ops::show(path, oid, app.width) {
             Ok(text) => {
                 let title = format!("git show {}", &oid.to_string()[..7]);
