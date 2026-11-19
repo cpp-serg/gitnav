@@ -14,6 +14,11 @@ pub fn to_lines(text: &str) -> Vec<Line<'static>> {
 }
 
 /// Parses one line; `style` carries over, since a colour may span lines.
+/// Whether `text` shows nothing but blanks once its escape sequences are taken out.
+pub fn is_blank(text: &str) -> bool {
+    to_lines(text).iter().all(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+}
+
 fn parse_line(line: &str, style: &mut Style) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();

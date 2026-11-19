@@ -6,10 +6,12 @@ mod matcher;
 mod ops;
 mod order;
 mod repo;
+mod state;
 mod ui;
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,7 +23,7 @@ use ratatui::crossterm::terminal::{
 };
 
 use app::{App, Command, Dialog};
-use ops::PullOutcome;
+use ops::{Change, DiffTool, PullOutcome};
 use config::Settings;
 
 fn main() -> Result<()> {
@@ -30,6 +32,7 @@ fn main() -> Result<()> {
     let mut app = App::new(history, settings.view.clone());
     app.watch = settings.watch;
     app.interval = settings.interval;
+    app.diff_tool = state::load().diff_tool;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &settings.path);
@@ -37,16 +40,45 @@ fn main() -> Result<()> {
     result
 }
 
+/// How often the loop looks for answers while merges are being worked out.
+const CLASSIFY_POLL: Duration = Duration::from_millis(30);
+
+/// A thread that works out what merges did (`repo::merge_kind`), one at a time as asked, so
+/// that a slow one never holds up the keys. Returns where to ask and where the answers come.
+fn merge_worker(path: &Path) -> (mpsc::Sender<git2::Oid>, mpsc::Receiver<(git2::Oid, repo::MergeKind)>) {
+    let (ask, asked) = mpsc::channel::<git2::Oid>();
+    let (answer, answers) = mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let repo = git2::Repository::discover(&path).ok();
+        for oid in asked {
+            let kind = repo.as_ref().map_or(repo::MergeKind::Unknown, |r| repo::merge_kind(r, oid));
+            if answer.send((oid, kind)).is_err() {
+                break;
+            }
+        }
+    });
+    (ask, answers)
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App, path: &Path) -> Result<()> {
     let mut next_check = Instant::now() + app.interval;
+    let (ask, answers) = merge_worker(path);
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
+        // Only the merges on screen, now that the screen's rows are known.
+        for oid in app.merges_to_classify() {
+            let _ = ask.send(oid);
+        }
 
-        let timeout = if app.watch {
+        let mut timeout = if app.watch {
             next_check.saturating_duration_since(Instant::now())
         } else {
             Duration::from_secs(3600)
         };
+        if app.classifying() {
+            timeout = timeout.min(CLASSIFY_POLL);
+        }
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -57,6 +89,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, path: &Path) -> Result<()>
                 // Catch up on changes made while not watching.
                 next_check = Instant::now();
             }
+        }
+
+        while let Ok((oid, kind)) = answers.try_recv() {
+            app.merge_classified(oid, kind);
         }
 
         if let Some(command) = app.command.take() {
@@ -195,21 +231,34 @@ fn run_command(
             };
             reload(app, path, &note);
         }
-        Command::Show(oid) => match ops::show(path, oid, app.width) {
-            Ok(text) => {
-                let title = format!("git show {}", &oid.to_string()[..7]);
-                app.pager = Some(app::Pager::new(title, ansi::to_lines(&text)));
+        Command::Show(oid) => show(terminal, app, path, Change::Commit(oid))?,
+        Command::Resolution(oid) => {
+            // diffnav takes plain diffs; the resolution reads better with git's own notes.
+            let tool = if app.diff_tool == DiffTool::Difft && app.diff_tool.available() { DiffTool::Difft } else { DiffTool::Git };
+            match ops::resolution(path, oid, tool, app.width) {
+                Ok(Some(text)) => {
+                    let title = format!("remerge-diff {}", repo::short(oid));
+                    app.pager = Some(app::Pager::new(title, ansi::to_lines(&text)));
+                }
+                Ok(None) => app.message = Some(format!("{}: nothing beyond the automatic merge", repo::short(oid))),
+                Err(e) => app.message = Some(format!("{e:#}")),
             }
+        }
+        Command::Diff(first, second) => match ops::diff_order(path, first, second) {
+            Ok((from, to)) => show(terminal, app, path, Change::Between(from, to))?,
             Err(e) => app.message = Some(format!("{e:#}")),
         },
-        Command::Diff(from, to) => match ops::diff(path, from, to, app.width) {
-            Ok(text) if text.trim().is_empty() => app.message = Some("no differences".into()),
-            Ok(text) => {
-                let title = format!("git diff {} {}", &from.to_string()[..7], &to.to_string()[..7]);
-                app.pager = Some(app::Pager::new(title, ansi::to_lines(&text)));
+        Command::SaveState => {
+            let tool = app.diff_tool;
+            let mut note = format!("diff tool: {}", tool.name());
+            if !tool.available() {
+                note += &format!(" (not installed: {} instead)", DiffTool::Git.name());
             }
-            Err(e) => app.message = Some(format!("{e:#}")),
-        },
+            if let Err(e) = state::save(&state::State { diff_tool: tool }) {
+                note += &format!("; {e:#}");
+            }
+            app.message = Some(note);
+        }
         Command::AbortRebase => {
             app.message = Some(match ops::abort_rebase(path) {
                 Ok(()) => "rebase aborted".into(),
@@ -248,6 +297,52 @@ fn outside_tui<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> Resu
     enable_raw_mode()?;
     terminal.clear()?;
     Ok(result)
+}
+
+/// Enter and `d`: `change` in the chosen tool, or in git if that is missing.
+fn show(terminal: &mut DefaultTerminal, app: &mut App, path: &Path, change: Change) -> Result<()> {
+    let change = match change.resolve(path) {
+        Ok(change) => change,
+        Err(e) => {
+            app.message = Some(format!("{e:#}"));
+            return Ok(());
+        }
+    };
+    let chosen = app.diff_tool;
+    let tool = if chosen.available() { chosen } else { DiffTool::Git };
+    // diffnav shows only the diff, and git a commit's message too, so an empty one is worth it.
+    match ops::changes_nothing(path, change) {
+        Ok(true) if tool == DiffTool::Diffnav || matches!(change, Change::Between(..)) => {
+            app.message = Some("no differences".into());
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            app.message = Some(format!("{e:#}"));
+            return Ok(());
+        }
+    }
+    if tool == DiffTool::Diffnav {
+        if let Err(e) = outside_tui(terminal, || ops::diffnav(path, change))? {
+            app.message = Some(format!("{e:#}"));
+        } else if let Change::Commit(c) = change
+            && app.merge_kinds.get(&c) == Some(&repo::MergeKind::Resolved)
+        {
+            // diffnav showed the merge against its first parent only.
+            app.message = Some(format!("{} has changes made by hand in the merge: m shows them", repo::short(c)));
+        }
+        return Ok(());
+    }
+    match ops::text(path, change, tool, app.width) {
+        Ok(text) => {
+            app.pager = Some(app::Pager::new(change.title(tool), ansi::to_lines(&text)));
+            if tool != chosen {
+                app.message = Some(format!("{} is not installed: {} instead", chosen.name(), tool.name()));
+            }
+        }
+        Err(e) => app.message = Some(format!("{e:#}")),
+    }
+    Ok(())
 }
 
 /// Loads the history again; on failure the old one stays and the status line says why.

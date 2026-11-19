@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, DeleteDialog, Dialog, HELP, Prompt, PromptKind};
 use crate::matcher;
+use crate::repo::MergeKind;
 
 /// Lane colours, in the order git cycles through them.
 const LANE_COLORS: [Color; crate::graph::COLORS as usize] = [
@@ -270,7 +271,9 @@ fn commit_line(app: &App, row: usize) -> Line<'_> {
         let hidden_merge = glyph == '●' && c.merge && app.view.first_parent;
         let (glyph, style) = match glyph {
             '●' if is_head => ('◉', Style::new().fg(head_color(app, row)).add_modifier(Modifier::BOLD)),
+            '●' if c.is_worktree() => ('◌', Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             '●' if hidden_merge => ('◆', style.add_modifier(Modifier::BOLD)),
+            '●' if c.merge => (merge_glyph(app.merge_kinds.get(&c.oid)), style),
             '●' if c.deleted => ('○', style),
             g => (g, style),
         };
@@ -291,6 +294,8 @@ fn commit_line(app: &App, row: usize) -> Line<'_> {
     let id_style = if is_head {
         // The head's hash as a badge, so the row stands out.
         Style::new().fg(Color::Black).bg(head_color(app, row)).add_modifier(bold)
+    } else if c.is_worktree() {
+        Style::new().fg(Color::Yellow).add_modifier(bold)
     } else {
         Style::new().fg(Color::Blue).add_modifier(bold)
     };
@@ -338,6 +343,16 @@ fn commit_line(app: &App, row: usize) -> Line<'_> {
         insert_at(&mut spans, text_start, c.short_id().chars().count(), count);
     }
     Line::from(spans)
+}
+
+/// A merge's glyph by what it did (`repo::MergeKind`), or the plain one while not known.
+fn merge_glyph(kind: Option<&MergeKind>) -> char {
+    match kind {
+        Some(MergeKind::Forced) => '⊙',
+        Some(MergeKind::Clean) => '⊕',
+        Some(MergeKind::Resolved) => '⊗',
+        Some(MergeKind::Unknown) | None => '●',
+    }
 }
 
 /// Inserts `new` `chars` characters into the spans from `from` on, splitting a span if needed.
@@ -569,6 +584,7 @@ mod tests {
     #[test]
     fn highlight_marks_the_matched_characters() {
         let mut a = app();
+        a.match_mode.fuzzy = true;
         a.search = Some("hlab".into());
         let line = commit_line(&a, 0);
         let marked: String = line

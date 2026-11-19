@@ -1,12 +1,14 @@
 //! Operations that run the git CLI: pull and rebase (libgit2 has no pull, no rebase with
-//! autostash, and does not use git's credential helpers or ssh setup), `git show`, and
-//! deleting branches and tags, locally and on remotes.
+//! autostash, and does not use git's credential helpers or ssh setup), `git show`, `git diff`
+//! (also into diffnav or difftastic), and deleting branches and tags, locally and on remotes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use git2::{Repository, RepositoryState};
+
+use crate::repo::{is_worktree, short};
 
 pub enum PullOutcome {
     /// The branch moved (or was already up to date): the summary says which.
@@ -82,23 +84,281 @@ pub fn pull(path: &Path) -> Result<PullOutcome> {
     }))
 }
 
-/// `git show` of one commit as text, passed through the pager git would use for it (delta,
-/// say), with its colours. `width` is the room it gets, for pagers that lay out by width.
-pub fn show(path: &Path, oid: git2::Oid, width: usize) -> Result<String> {
-    colored(path, &["show".into(), oid.to_string()], width)
+/// What the commit view or a diff tool shows: one commit with its change (`git show`), or the
+/// diff between two commits (`git diff from to`). Either commit can be the working tree
+/// (`repo::worktree_id`): its own change is the diff from HEAD, `git diff HEAD`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Commit(git2::Oid),
+    Between(git2::Oid, git2::Oid),
 }
 
-/// `git diff from to` as text, passed through the pager as `show` does.
-pub fn diff(path: &Path, from: git2::Oid, to: git2::Oid, width: usize) -> Result<String> {
-    colored(path, &["diff".into(), from.to_string(), to.to_string()], width)
+impl Change {
+    /// The working tree's own change as the diff from HEAD to it; anything else as it is.
+    pub fn resolve(self, path: &Path) -> Result<Change> {
+        Ok(match self {
+            Change::Commit(c) if is_worktree(c) => {
+                let head = Repository::discover(path)?.head()?.peel_to_commit()?.id();
+                Change::Between(head, c)
+            }
+            change => change,
+        })
+    }
+
+    /// The git command and its arguments; `options` go after the command name. The working
+    /// tree is no revision: `git diff from` diffs from a commit to it, `-R` the other way.
+    fn args(self, options: &[&str]) -> Vec<String> {
+        let (command, revs): (&str, Vec<String>) = match self {
+            Change::Commit(c) => ("show", vec![c.to_string()]),
+            Change::Between(from, to) if is_worktree(to) => ("diff", vec![from.to_string()]),
+            Change::Between(from, to) if is_worktree(from) => ("diff", vec!["-R".into(), to.to_string()]),
+            Change::Between(from, to) => ("diff", vec![from.to_string(), to.to_string()]),
+        };
+        let mut args = vec![command.to_string()];
+        args.extend(options.iter().map(|o| o.to_string()));
+        args.extend(revs);
+        args
+    }
+
+    /// A title such as `git show 1a2b3c4` or `difft 1a2b3c4 <WTREE>`.
+    pub fn title(self, tool: DiffTool) -> String {
+        let revs = match self {
+            Change::Commit(c) => short(c),
+            Change::Between(from, to) => format!("{} {}", short(from), short(to)),
+        };
+        match (tool, self) {
+            (DiffTool::Git, Change::Commit(_)) => format!("git show {revs}"),
+            _ => format!("{} {revs}", tool.name()),
+        }
+    }
 }
 
-/// The output of the git command `args` (`args[0]` names it), coloured and passed through the
-/// pager git would use for that command.
-fn colored(path: &Path, args: &[String], width: usize) -> Result<String> {
+/// Whether `change` changes no file: two commits with the same tree, or a commit with the
+/// same tree as its first parent (an empty tree for a root commit). A change to or from the
+/// working tree counts as one: its row is only there while it differs from HEAD.
+pub fn changes_nothing(path: &Path, change: Change) -> Result<bool> {
+    let repo = Repository::discover(path)?;
+    let tree = |oid| -> Result<git2::Oid> { Ok(repo.find_commit(oid)?.tree_id()) };
+    Ok(match change {
+        Change::Commit(c) | Change::Between(c, _) | Change::Between(_, c) if is_worktree(c) => false,
+        Change::Between(from, to) => tree(from)? == tree(to)?,
+        Change::Commit(c) => {
+            let commit = repo.find_commit(c)?;
+            let before = match commit.parent_ids().next() {
+                Some(p) => tree(p)?,
+                None => repo.treebuilder(None)?.write()?,
+            };
+            commit.tree_id() == before
+        }
+    })
+}
+
+/// The two selected commits in the order to diff them: from the ancestor to its descendant
+/// if one is an ancestor of the other, else from the second selected to the first. The working
+/// tree descends from HEAD and everything HEAD reaches.
+pub fn diff_order(path: &Path, first: git2::Oid, second: git2::Oid) -> Result<(git2::Oid, git2::Oid)> {
+    let repo = Repository::discover(path)?;
+    let head = || -> Result<git2::Oid> { Ok(repo.head()?.peel_to_commit()?.id()) };
+    // Whether `older` is an ancestor of `newer`.
+    let ancestor = |older: git2::Oid, newer: git2::Oid| -> Result<bool> {
+        if is_worktree(older) {
+            return Ok(false);
+        }
+        let newer = if is_worktree(newer) { head()? } else { newer };
+        Ok(older == newer || repo.graph_descendant_of(newer, older)?)
+    };
+    Ok(if first != second && ancestor(first, second)? { (first, second) } else { (second, first) })
+}
+
+/// `change` as coloured text for the commit view, `width` wide: through the pager git would
+/// use for it (delta, say), or with difftastic as git's external diff. A merge commit gets
+/// `merge_text`.
+pub fn text(path: &Path, change: Change, tool: DiffTool, width: usize) -> Result<String> {
     let dir = workdir_or_gitdir(path)?;
-    let pager = configured_pager(&dir, &args[0]).and_then(|p| filter_pager(&p, width));
-    run_through(&dir, args, width, pager.as_deref())
+    if let Change::Commit(c) = change {
+        let parents = parents(path, c)?;
+        if parents.len() > 1 {
+            return merge_text(&dir, c, &parents, tool, width);
+        }
+    }
+    render(&dir, change.args(&[]), tool, width)
+}
+
+/// The git command `args` (`args[0]` names it) as coloured text, `width` wide: through the
+/// pager git would use for that command, or with difftastic as git's external diff.
+fn render(dir: &Path, mut args: Vec<String>, tool: DiffTool, width: usize) -> Result<String> {
+    if tool != DiffTool::Difft {
+        let pager = configured_pager(dir, &args[0]).and_then(|p| filter_pager(&p));
+        return run_through(dir, &args, width, pager.as_deref());
+    }
+    args.splice(1..1, ["--ext-diff".to_string(), "--color=always".to_string()]);
+    let out = Command::new("git")
+        .args(["-c", "diff.external=difft", "--no-pager"])
+        .args(&args)
+        .env("DFT_COLOR", "always")
+        .env("DFT_WIDTH", width.to_string())
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("running git with difft")?;
+    if !out.status.success() {
+        bail!("git with difft failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A commit's parents, first parent first.
+fn parents(path: &Path, oid: git2::Oid) -> Result<Vec<git2::Oid>> {
+    Ok(Repository::discover(path)?.find_commit(oid)?.parent_ids().collect())
+}
+
+/// Commits listed in the merge view at most.
+const MERGED_LISTED: usize = 100;
+
+/// A merge for the commit view: its message, the commits it brought in, what was done by
+/// hand beyond the automatic merge (`--remerge-diff`, only when there is something), and its
+/// changes against the first parent: the branch's whole change, as a pull request shows it.
+/// git's own view of a merge, the combined diff, is empty for most merges.
+fn merge_text(dir: &Path, merge: git2::Oid, parents: &[git2::Oid], tool: DiffTool, width: usize) -> Result<String> {
+    let title = |text: String| format!("\n\x1b[1;33m{text}\x1b[0m\n\n");
+    let mut out = render(dir, vec!["show".into(), "--no-patch".into(), merge.to_string()], tool, width)?;
+
+    let mut range: Vec<String> = vec![format!("^{}", parents[0])];
+    range.extend(parents[1..].iter().map(|p| p.to_string()));
+    let git = |args: &[&str]| -> Result<String> {
+        let out = Command::new("git").arg("--no-pager").args(args).args(&range).current_dir(dir).stdin(Stdio::null()).output()?;
+        if !out.status.success() {
+            bail!("git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let count: usize = git(&["rev-list", "--count"])?.trim().parse().unwrap_or(0);
+    let from: Vec<String> = parents[1..].iter().map(|&p| short(p)).collect();
+    out += &title(format!("Brought in from {} ({count} commit{}):", from.join(", "), if count == 1 { "" } else { "s" }));
+    out += &git(&["log", "--oneline", "--color=always", &format!("--max-count={MERGED_LISTED}")])?;
+    if count > MERGED_LISTED {
+        out += &format!("… and {} more\n", count - MERGED_LISTED);
+    }
+
+    if parents.len() == 2 {
+        let resolution = resolution_text(dir, merge, tool, width)?;
+        if !resolution.is_empty() {
+            out += &title("Done by hand, against the automatic merge of the parents (git show --remerge-diff):".into());
+            out += &resolution;
+        }
+    }
+    out += &title(format!("Changes against the first parent, {}:", short(parents[0])));
+    out += &render(dir, vec!["diff".into(), parents[0].to_string(), merge.to_string()], tool, width)?;
+    Ok(out)
+}
+
+/// What a merge has beyond the automatic merge of its parents (`git show --remerge-diff`):
+/// conflict resolutions and changes of its own. Empty if nothing.
+fn resolution_text(dir: &Path, merge: git2::Oid, tool: DiffTool, width: usize) -> Result<String> {
+    let text = render(dir, vec!["show".into(), "--remerge-diff".into(), "--format=".into(), merge.to_string()], tool, width)?;
+    Ok(if crate::ansi::is_blank(&text) { String::new() } else { text })
+}
+
+/// `m`: a merge's message and what it has beyond the automatic merge, or `None` if nothing.
+pub fn resolution(path: &Path, merge: git2::Oid, tool: DiffTool, width: usize) -> Result<Option<String>> {
+    let dir = workdir_or_gitdir(path)?;
+    if parents(path, merge)?.len() != 2 {
+        bail!("{} is not a merge of two parents", short(merge));
+    }
+    let resolution = resolution_text(&dir, merge, tool, width)?;
+    if resolution.is_empty() {
+        return Ok(None);
+    }
+    let header = render(&dir, vec!["show".into(), "--no-patch".into(), merge.to_string()], tool, width)?;
+    Ok(Some(format!("{header}\n{resolution}")))
+}
+
+/// `change` piped into diffnav, which has the terminal until it quits: run it with the terminal
+/// handed over. A merge shows against its first parent.
+pub fn diffnav(path: &Path, change: Change) -> Result<()> {
+    let dir = workdir_or_gitdir(path)?;
+    // Plain text: diffnav reads the diff itself, and colour codes would get in its way. It
+    // reads only the diff, so a commit comes without its message.
+    let options: &[&str] = match change {
+        Change::Commit(_) => &["--no-color", "--no-ext-diff", "--format=", "--diff-merges=first-parent"],
+        Change::Between(..) => &["--no-color", "--no-ext-diff"],
+    };
+    let mut git = Command::new("git")
+        .arg("--no-pager")
+        .args(change.args(options))
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git")?;
+    let status = Command::new("diffnav")
+        .current_dir(&dir)
+        .stdin(git.stdout.take().expect("piped"))
+        .status()
+        .context("running diffnav")?;
+    let out = git.wait_with_output().context("running git")?;
+    if !out.status.success() {
+        bail!("git failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    if !status.success() {
+        bail!("diffnav failed ({status})");
+    }
+    Ok(())
+}
+
+/// What Enter and `d` show a change with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffTool {
+    /// diffnav, a diff viewer with a file tree; it takes over the terminal.
+    #[default]
+    Diffnav,
+    /// Difftastic, a structural diff, as git's external diff; shown in the commit view.
+    Difft,
+    /// `git show` or `git diff` through the configured pager, shown in the commit view.
+    Git,
+}
+
+impl DiffTool {
+    pub fn name(self) -> &'static str {
+        match self {
+            DiffTool::Diffnav => "diffnav",
+            DiffTool::Difft => "difft",
+            DiffTool::Git => "git diff",
+        }
+    }
+
+    pub fn next(self) -> DiffTool {
+        match self {
+            DiffTool::Diffnav => DiffTool::Difft,
+            DiffTool::Difft => DiffTool::Git,
+            DiffTool::Git => DiffTool::Diffnav,
+        }
+    }
+
+    /// The program it needs besides git.
+    fn program(self) -> Option<&'static str> {
+        match self {
+            DiffTool::Diffnav => Some("diffnav"),
+            DiffTool::Difft => Some("difft"),
+            DiffTool::Git => None,
+        }
+    }
+
+    /// Whether its program is on `PATH`.
+    pub fn available(self) -> bool {
+        self.program().is_none_or(|p| on_path(p, std::env::var_os("PATH")))
+    }
+}
+
+/// Whether `program` is an executable file in one of the directories of `path`.
+fn on_path(program: &str, path: Option<std::ffi::OsString>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = path else { return false };
+    std::env::split_paths(&path).any(|dir| {
+        std::fs::metadata(dir.join(program)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
 }
 
 /// The git command `args` in `dir`, piped through `pager` if there is one.
@@ -127,6 +387,7 @@ fn run_through(dir: &Path, args: &[String], width: usize, pager: Option<&str>) -
         .env("LESS", std::env::var("LESS").unwrap_or_else(|_| "FRX".into()))
         .env("LV", "-c")
         .env("COLUMNS", width.to_string())
+        .env("GIT_CONFIG_PARAMETERS", delta_config(width, std::env::var("GIT_CONFIG_PARAMETERS").ok()))
         .stdin(show.stdout.take().expect("piped"))
         .output()
         .with_context(|| format!("running the pager: {pager}"))?;
@@ -157,13 +418,25 @@ fn configured_pager(dir: &Path, command: &str) -> Option<String> {
 
 /// `pager` as the command to filter the text through, if it is one that rewrites the text
 /// (delta, diff-so-fancy, …) rather than one that pages it interactively (less, more), whose
-/// job the commit view does itself. Delta is told the width and not to page.
-fn filter_pager(pager: &str, width: usize) -> Option<String> {
+/// job the commit view does itself.
+fn filter_pager(pager: &str) -> Option<String> {
     let program = pager.split_whitespace().next()?;
     match Path::new(program).file_name()?.to_str()? {
         "less" | "more" | "most" | "lv" | "cat" => None,
-        "delta" => Some(format!("{pager} --paging=never --width={width}")),
         _ => Some(pager.to_string()),
+    }
+}
+
+/// `GIT_CONFIG_PARAMETERS` for the pager: `existing`, plus delta's width and no paging of its
+/// own. Delta reads its settings from git's config, this variable included, so they reach it
+/// however the pager command starts it (`exec delta || exec less`, say). Not `COLUMNS` or a
+/// `--width` added to the command: delta before 0.20 ignores `COLUMNS`, and a flag can only be
+/// added where the command is just delta.
+fn delta_config(width: usize, existing: Option<String>) -> String {
+    let ours = format!("'delta.width'='{width}' 'delta.paging'='never'");
+    match existing.filter(|e| !e.trim().is_empty()) {
+        Some(e) => format!("{e} {ours}"),
+        None => ours,
     }
 }
 
@@ -506,14 +779,183 @@ mod tests {
     }
 
     #[test]
+    fn diff_tools() {
+        assert_eq!(DiffTool::default(), DiffTool::Diffnav);
+        let cycle = [DiffTool::Diffnav, DiffTool::Difft, DiffTool::Git, DiffTool::Diffnav];
+        assert!(cycle.windows(2).all(|w| w[0].next() == w[1]));
+        assert!(DiffTool::Git.available(), "git diff needs nothing else");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tool = bin.join("tool");
+        std::fs::write(&tool, "").unwrap();
+        let path = || Some(std::env::join_paths([tmp.path(), &bin]).unwrap());
+        assert!(!on_path("tool", path()), "not executable");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(on_path("tool", path()));
+        assert!(!on_path("bin", path()), "a directory is not a program");
+        assert!(!on_path("tool", None));
+    }
+
+    #[test]
+    fn changes_order_and_difft() {
+        let (_tmp, mine, _theirs) = setup();
+        let rev = |r: &str| git2::Oid::from_str(git(&mine, &["rev-parse", r]).trim()).unwrap();
+        let commit = |file: &str, message: &str| {
+            std::fs::write(mine.join(file), "new line\n").unwrap();
+            git(&mine, &["add", file]);
+            git(&mine, &["commit", "-q", "-m", message]);
+            rev("HEAD")
+        };
+        let old = rev("HEAD");
+        git(&mine, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = rev("HEAD");
+        let new = commit("added", "add");
+        git(&mine, &["checkout", "-q", "-b", "side", &old.to_string()]);
+        let side = commit("other", "side");
+
+        assert!(changes_nothing(&mine, Change::Between(old, empty)).unwrap());
+        assert!(changes_nothing(&mine, Change::Commit(empty)).unwrap());
+        assert!(!changes_nothing(&mine, Change::Between(empty, new)).unwrap());
+        assert!(!changes_nothing(&mine, Change::Commit(new)).unwrap());
+        assert!(!changes_nothing(&mine, Change::Commit(old)).unwrap(), "a root commit adds its files");
+
+        // An ancestor and its descendant go from the ancestor, in either selection order.
+        assert_eq!(diff_order(&mine, old, new).unwrap(), (old, new));
+        assert_eq!(diff_order(&mine, new, old).unwrap(), (old, new));
+        // Unrelated: from the second selected to the first.
+        assert_eq!(diff_order(&mine, side, new).unwrap(), (new, side));
+        assert_eq!(diff_order(&mine, new, side).unwrap(), (side, new));
+
+        assert_eq!(Change::Commit(new).title(DiffTool::Git), format!("git show {:.7}", new.to_string()));
+        assert_eq!(Change::Between(old, new).title(DiffTool::Difft), format!("difft {:.7} {:.7}", old.to_string(), new.to_string()));
+        if DiffTool::Difft.available() {
+            let between = plain(&text(&mine, Change::Between(old, new), DiffTool::Difft, 80).unwrap());
+            assert!(between.contains("added") && between.contains("new line"), "{between}");
+            let shown = plain(&text(&mine, Change::Commit(new), DiffTool::Difft, 80).unwrap());
+            assert!(shown.contains(&format!("commit {new}")) && shown.contains("new line"), "{shown}");
+
+            // A merge: against its first parent (side), so it brings in the file added on new.
+            git(&mine, &["merge", "-q", "--no-ff", "-m", "merge", &new.to_string()]);
+            let merged = plain(&text(&mine, Change::Commit(rev("HEAD")), DiffTool::Difft, 80).unwrap());
+            assert!(!merged.contains("diff --cc"), "{merged}");
+            assert!(merged.contains("added") && merged.contains("new line"), "{merged}");
+        }
+    }
+
+    #[test]
+    fn worktree_changes() {
+        let (_tmp, mine, _theirs) = setup();
+        let rev = |r: &str| git2::Oid::from_str(git(&mine, &["rev-parse", r]).trim()).unwrap();
+        let old = rev("HEAD");
+        std::fs::write(mine.join("added"), "committed\n").unwrap();
+        git(&mine, &["add", "added"]);
+        git(&mine, &["commit", "-q", "-m", "add"]);
+        let head = rev("HEAD");
+        git(&mine, &["checkout", "-q", "-b", "side", &old.to_string()]);
+        std::fs::write(mine.join("other"), "side\n").unwrap();
+        git(&mine, &["add", "other"]);
+        git(&mine, &["commit", "-q", "-m", "side"]);
+        let side = rev("HEAD");
+        git(&mine, &["checkout", "-q", "-"]);
+        std::fs::write(mine.join("added"), "changed\n").unwrap();
+        let wt = crate::repo::worktree_id();
+
+        // Its own change is the diff from HEAD.
+        assert_eq!(Change::Commit(wt).resolve(&mine).unwrap(), Change::Between(head, wt));
+        assert_eq!(Change::Commit(head).resolve(&mine).unwrap(), Change::Commit(head));
+        assert!(!changes_nothing(&mine, Change::Between(head, wt)).unwrap());
+        let diff = |c: Change| plain(&run_through(&mine, &c.args(&[]), 100, None).unwrap());
+        let own = diff(Change::Between(head, wt));
+        assert!(own.contains("-committed\n+changed"), "{own}");
+        assert!(diff(Change::Between(wt, head)).contains("-changed\n+committed"));
+        assert_eq!(Change::Between(head, wt).title(DiffTool::Git), format!("git diff {:.7} <WTREE>", head.to_string()));
+
+        // It descends from HEAD and what HEAD reaches; not from a side branch.
+        assert_eq!(diff_order(&mine, wt, head).unwrap(), (head, wt));
+        assert_eq!(diff_order(&mine, head, wt).unwrap(), (head, wt));
+        assert_eq!(diff_order(&mine, wt, old).unwrap(), (old, wt));
+        assert_eq!(diff_order(&mine, side, wt).unwrap(), (wt, side), "unrelated: second to first");
+        assert_eq!(diff_order(&mine, wt, side).unwrap(), (side, wt));
+    }
+
+    #[test]
+    fn merge_view_and_resolution() {
+        let (_tmp, mine, _theirs) = setup();
+        let rev = |r: &str| git2::Oid::from_str(git(&mine, &["rev-parse", r]).trim()).unwrap();
+        let change = |file: &str, text: &str, message: &str| {
+            std::fs::write(mine.join(file), text).unwrap();
+            git(&mine, &["add", file]);
+            git(&mine, &["commit", "-q", "-m", message]);
+        };
+        let base = rev("HEAD").to_string();
+        // A forced merge of a branch with two commits.
+        git(&mine, &["checkout", "-q", "-b", "feat"]);
+        change("a", "a\n", "feat one");
+        change("b", "b\n", "feat two");
+        git(&mine, &["checkout", "-q", "-b", "forced", &base]);
+        git(&mine, &["merge", "-q", "--no-ff", "-m", "forced merge", "feat"]);
+        let forced = rev("HEAD");
+        // A conflict resolved by hand.
+        git(&mine, &["checkout", "-q", "-b", "x", &base]);
+        change("f", "x\n", "x");
+        git(&mine, &["checkout", "-q", "-b", "y", &base]);
+        change("f", "y\n", "y");
+        let merged = Command::new("git").args(["merge", "-q", "x"]).current_dir(&mine).env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+        assert!(!merged.status.success(), "it conflicts");
+        std::fs::write(mine.join("f"), "x and y\n").unwrap();
+        git(&mine, &["add", "f"]);
+        git(&mine, &["commit", "-q", "--no-edit"]);
+        let resolved = rev("HEAD");
+
+        let view = |m| plain(&text(&mine, Change::Commit(m), DiffTool::Git, 100).unwrap());
+        let shown = view(forced);
+        assert!(shown.contains("forced merge"), "{shown}");
+        assert!(shown.contains("Brought in from") && shown.contains("(2 commits):"), "{shown}");
+        assert!(shown.contains("feat one") && shown.contains("feat two"), "{shown}");
+        assert!(!shown.contains("Done by hand"), "nothing done by hand: {shown}");
+        assert!(shown.contains("Changes against the first parent") && shown.contains("+a") && shown.contains("+b"), "{shown}");
+        assert!(resolution(&mine, forced, DiffTool::Git, 100).unwrap().is_none());
+
+        let shown = view(resolved);
+        assert!(shown.contains("(1 commit):") && shown.contains("Done by hand"), "{shown}");
+        assert!(shown.contains("x and y"), "{shown}");
+        let only = plain(&resolution(&mine, resolved, DiffTool::Git, 100).unwrap().unwrap());
+        assert!(only.contains("x and y") && !only.contains("Changes against"), "{only}");
+        assert!(resolution(&mine, rev("x"), DiffTool::Git, 100).is_err(), "not a merge");
+    }
+
+    #[test]
     fn which_pagers_filter() {
-        assert_eq!(filter_pager("delta", 120).as_deref(), Some("delta --paging=never --width=120"));
-        assert_eq!(filter_pager("/usr/local/bin/delta --dark", 80).as_deref(), Some("/usr/local/bin/delta --dark --paging=never --width=80"));
-        assert_eq!(filter_pager("diff-so-fancy | less", 80).as_deref(), Some("diff-so-fancy | less"));
-        assert_eq!(filter_pager("less -RS", 80), None);
-        assert_eq!(filter_pager("/usr/bin/more", 80), None);
-        assert_eq!(filter_pager("cat", 80), None);
-        assert_eq!(filter_pager("", 80), None);
+        assert_eq!(filter_pager("delta").as_deref(), Some("delta"));
+        assert_eq!(filter_pager("/usr/local/bin/delta --dark").as_deref(), Some("/usr/local/bin/delta --dark"));
+        assert_eq!(filter_pager("diff-so-fancy | less").as_deref(), Some("diff-so-fancy | less"));
+        assert_eq!(filter_pager("less -RS"), None);
+        assert_eq!(filter_pager("/usr/bin/more"), None);
+        assert_eq!(filter_pager("cat"), None);
+        assert_eq!(filter_pager(""), None);
+    }
+
+    #[test]
+    fn the_pager_gets_the_width() {
+        assert_eq!(delta_config(90, None), "'delta.width'='90' 'delta.paging'='never'");
+        assert_eq!(delta_config(90, Some("'a.b'='c'".into())), "'a.b'='c' 'delta.width'='90' 'delta.paging'='never'");
+
+        let (_tmp, mine, _theirs) = setup();
+        let head = Repository::open(&mine).unwrap().head().unwrap().target().unwrap();
+        let args = ["show".to_string(), head.to_string()];
+        let said = run_through(&mine, &args, 123, Some("cat >/dev/null; printf %s \"$GIT_CONFIG_PARAMETERS\"")).unwrap();
+        assert!(said.ends_with("'delta.width'='123' 'delta.paging'='never'"), "{said}");
+
+        // Delta inside a shell construct, as `pager.show` may have it: its rules span the width.
+        if on_path("delta", std::env::var_os("PATH")) {
+            let construct = "command -v delta >/dev/null && exec delta || exec cat";
+            let text = plain(&run_through(&mine, &args, 100, Some(construct)).unwrap());
+            let widest = text.lines().map(|l| l.chars().filter(|&c| c == '─').count()).max().unwrap_or(0);
+            assert!((95..=100).contains(&widest), "widest rule {widest}:\n{text}");
+        }
     }
 
     #[test]

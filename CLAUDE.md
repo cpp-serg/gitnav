@@ -40,7 +40,13 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   `repo::simplify`, `graph::layout`) relies on it; a parent always has a higher row index.
 - **`repo.rs`** walks all refs (except `refs/prefetch/*`) plus HEAD, optionally reflogs or every
   commit object (`Deleted`), sorts with `order::sort`, and builds `History` (commits with parents
-  as row indices, git-`%D`-style decorations, a ref fingerprint, the HEAD row). `simplify(history,
+  as row indices, git-`%D`-style decorations, a ref fingerprint, the HEAD row). While tracked
+  files differ from HEAD (`git diff HEAD`, submodules only by their commit), a `<WTREE>` row
+  with the all-zero id (`worktree_id`) sits on top of HEAD as its child; the fingerprint
+  counts those files, so watching adds and drops it. `ops::Change` turns it into `git diff`
+  against HEAD or another commit. `merge_kind` works out what a merge did (`MergeKind`: forced
+  where a fast-forward was possible, clean, or resolved by hand) by merging its parents again
+  in memory; nothing is written. libgit2's answers match `git show --remerge-diff` on ggsn. `simplify(history,
   keep)` keeps a subset of rows and rejoins each kept commit to its nearest kept ancestors; real
   parent edges are never pruned, only joins made across hidden commits. Refs-only, the text
   filter and head-only all use it.
@@ -80,16 +86,28 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   the hash) is inserted after highlighting with `insert_at`.
 - **`ops.rs`** is the only place that runs the git CLI at runtime: pull with autostash and
   rebase, and rebase abort (libgit2 has no equivalent with git's credential handling; `main.rs`
-  leaves the alternate screen while they run so git can prompt), `git show` for the commit
-  view (Enter) and `git diff` of two selected commits, from the second selected to the first
-  (d), whose colours `ansi.rs` turns into styled lines for `app::Pager`, and deleting branches
-  and tags locally and on remotes (Delete). Anything that talks to a remote while the TUI owns
-  the terminal goes through `ops::batch`, which stops git and ssh from prompting; pushes run
-  outside the TUI instead.
+  leaves the alternate screen while they run so git can prompt), a `Change` (one commit as
+  `git show`, or two as `git diff`) for Enter and `d`, and deleting branches and tags locally
+  and on remotes (Delete). A change goes to the `DiffTool` chosen with `D`: diffnav (run
+  outside the TUI), difftastic as git's external diff, or git through its configured pager; the
+  last two land in `app::Pager`, with colours that `ansi.rs` turns into styled lines. A tool
+  not on `PATH` falls back to git. `d` diffs from an ancestor to its descendant, else from the
+  second selected commit to the first (`diff_order`). Anything that talks to a remote while
+  the TUI owns the terminal goes through `ops::batch`, which stops git and ssh from prompting;
+  pushes run outside the TUI instead.
 - **`config.rs`**: settings come from the config file
   (`$XDG_CONFIG_HOME/gitnav/config.toml`), then `$GITNAV_OPTS`, then the command line, later
   winning (`--hide` patterns add up). A new option needs a `--x`/`--no-x` pair in `Cli`, a
   kebab-case key in `FileConfig` (unknown keys are rejected), the `View` field, and a line in
   `after_help`.
+- **`state.rs`**: what the TUI keeps from one run to the next (the diff tool), in
+  `$XDG_STATE_HOME/gitnav/state.toml`, which gitnav writes itself; the config file stays the
+  user's.
+- **Merge kinds**: worked out only for the merges on screen, in a worker thread in `main.rs`
+  (`merge_worker`), never in the key path: after each draw `App::merges_to_classify` names
+  the new ones, and answers land in `App::merge_kinds`, kept by commit id across reloads.
+  `ui::merge_glyph` draws ⊙ ⊕ ⊗. Enter on a merge (git or difft) shows `ops::merge_text`: the
+  message, the commits brought in, what was done by hand (only if anything), and the diff
+  against the first parent; `m` shows only the hand-made part.
 - **Watching**: `main.rs` polls `repo::current_fingerprint` (all refs and HEAD) every interval
   and reloads when it differs from the one recorded at load.

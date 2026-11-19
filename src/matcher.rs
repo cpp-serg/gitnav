@@ -8,9 +8,10 @@ pub struct Mode {
     pub ignore_case: bool,
 }
 
+/// A plain substring, ignoring case; fuzzy only when asked for (Ctrl-f).
 impl Default for Mode {
     fn default() -> Self {
-        Mode { fuzzy: true, ignore_case: true }
+        Mode { fuzzy: false, ignore_case: true }
     }
 }
 

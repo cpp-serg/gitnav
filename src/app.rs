@@ -4,8 +4,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::graph;
 use crate::matcher::{self, Mode};
-use crate::ops::Deletion;
-use crate::repo::{self, History, View};
+use crate::ops::{Deletion, DiffTool};
+use crate::repo::{self, History, MergeKind, View};
 
 /// Columns moved by one `h` or `l`.
 const HSCROLL_STEP: usize = 8;
@@ -25,9 +25,18 @@ pub const HELP: &[(&str, &str)] = &[
     ("zz  zt  zb", "put the cursor row at the centre, top, bottom"),
     ("h l  ← →", "scroll sideways"),
     ("0", "scroll back to the left edge"),
-    ("Enter", "show the commit (git show); j k, Ctrl-d Ctrl-u, Space, gg G scroll; q Esc Enter close"),
+    ("Enter", "show the commit in the tool D chose; with commits selected: as d, the cursor's counted in"),
+    (" ", "in the view: j k, Ctrl-d Ctrl-u, Space, gg G scroll; q Esc Enter close"),
+    ("m", "on a merge: only what was done by hand beyond the automatic merge (--remerge-diff)"),
     ("Delete", "delete branches and tags at the commit, here or on remotes: a checklist"),
-    ("d", "diff two selected commits: git diff <second selected> <first selected>"),
+    ("d", "diff two selected commits, or the one selected and the cursor's; none: as Enter"),
+    (" ", "from an ancestor to its descendant, else from the second selected to the first"),
+    ("D", "tool for Enter and d: diffnav, difft, git (kept for later runs; missing: git)"),
+    ("", "Merges, as worked out for those on screen"),
+    ("⊙", "could have been a fast-forward: the merge only shows the branch (--no-ff)"),
+    ("⊕", "both sides had changes; exactly what merging them gives"),
+    ("⊗", "conflicts resolved by hand, or changes of its own: m shows them"),
+    ("●", "not worked out yet, or an octopus merge"),
     ("", "Selecting"),
     ("Space", "mark or unmark the commit, move down (marks keep the order they were made in)"),
     ("v", "start a range; v again marks it, from where it started"),
@@ -39,7 +48,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("f", "show only matching commits, joined to their nearest matching ancestors"),
     ("F", "clear the filter"),
     ("a", "only the head and what it reaches: on, off"),
-    ("Ctrl-f", "in / and f: fuzzy or exact match"),
+    ("Ctrl-f", "in / and f: exact match (the default) or fuzzy"),
     ("Ctrl-t", "in / and f: ignore case or match it"),
     ("Up  Ctrl-u  Ctrl-w", "in / and f: previous query, clear, delete a word"),
     ("", "View"),
@@ -64,12 +73,17 @@ pub enum Command {
     AbortRebase,
     /// Show a commit's contents (`git show`).
     Show(git2::Oid),
-    /// The diff between two commits, in the order they were selected (`git diff a b`).
+    /// The diff between two commits, given in the order they were selected; `main.rs` picks
+    /// the direction (`ops::diff_order`).
     Diff(git2::Oid, git2::Oid),
+    /// What a merge has beyond the automatic merge of its parents (`git show --remerge-diff`).
+    Resolution(git2::Oid),
     /// Find the branches and tags at a commit that could be deleted, and ask which.
     FindDeletables(git2::Oid),
     /// Delete what the delete dialog chose (`App::deletions`).
     Delete,
+    /// Save the choices that last from one run to the next (`App::diff_tool`).
+    SaveState,
 }
 
 /// The checklist of branches and tags to delete at a commit.
@@ -220,6 +234,12 @@ pub struct App {
     pub delete: Option<DeleteDialog>,
     /// What the delete checklist chose, for `Command::Delete`.
     pub deletions: Vec<Deletion>,
+    /// What `d` shows a diff with.
+    pub diff_tool: DiffTool,
+    /// What each merge did, as far as worked out; kept across reloads (it never changes).
+    pub merge_kinds: std::collections::HashMap<git2::Oid, MergeKind>,
+    /// Merges handed to the event loop to work out, not yet answered.
+    merges_asked: std::collections::HashSet<git2::Oid>,
     pub quit: bool,
 }
 
@@ -259,6 +279,9 @@ impl App {
             pager: None,
             delete: None,
             deletions: Vec::new(),
+            diff_tool: DiffTool::default(),
+            merge_kinds: Default::default(),
+            merges_asked: Default::default(),
             quit: false,
         };
         app.relayout();
@@ -266,16 +289,19 @@ impl App {
         app
     }
 
-    /// Puts the cursor on the layout head. With nothing newer above it, the head is the top
-    /// row; otherwise it is centred, so the newer commits above it are in view as well.
+    /// Puts the cursor on the layout head, or on the working tree's row when that sits on it.
+    /// With nothing newer above it, that row is the top one; otherwise it is centred, so the
+    /// newer commits above it are in view as well.
     fn go_to_head(&mut self) {
         let Some(head) = self.head_row else { return };
-        self.cursor = head;
         let commits = &self.history.commits;
-        if (0..head).any(|r| commits[r].time > commits[head].time) {
+        let worktree = (0..head).find(|&r| commits[r].is_worktree() && commits[r].parents.contains(&head));
+        let start = worktree.unwrap_or(head);
+        self.cursor = start;
+        if (0..start).any(|r| commits[r].time > commits[start].time) {
             self.center_cursor = true;
         } else {
-            self.offset = head;
+            self.offset = start;
         }
     }
 
@@ -379,6 +405,29 @@ impl App {
     /// The last row whose commit's line is on the screen.
     fn bottom(&self) -> usize {
         (self.offset + self.shown_from(self.offset).max(1) - 1).min(self.last())
+    }
+
+    /// The merges on screen not worked out yet and not asked for; they count as asked from now.
+    pub fn merges_to_classify(&mut self) -> Vec<git2::Oid> {
+        let rows = self.offset..(self.offset + self.shown_from(self.offset)).min(self.len());
+        let mut new = Vec::new();
+        for c in &self.history.commits[rows] {
+            if c.merge && !self.merge_kinds.contains_key(&c.oid) && self.merges_asked.insert(c.oid) {
+                new.push(c.oid);
+            }
+        }
+        new
+    }
+
+    /// Records what a merge did.
+    pub fn merge_classified(&mut self, oid: git2::Oid, kind: MergeKind) {
+        self.merges_asked.remove(&oid);
+        self.merge_kinds.insert(oid, kind);
+    }
+
+    /// Whether merges are being worked out.
+    pub fn classifying(&self) -> bool {
+        !self.merges_asked.is_empty()
     }
 
     /// Whether a row shows as selected: marked, or inside the visual range.
@@ -565,16 +614,12 @@ impl App {
             (None, KeyCode::Char('R'), false) => self.reload = true,
             (None, KeyCode::Char('@'), false) => self.set_head(),
             (None, KeyCode::Char('p'), false) => self.command = Some(Command::Pull),
-            (None, KeyCode::Delete, false) => {
-                if let Some(c) = self.history.commits.get(self.cursor) {
-                    self.command = Some(Command::FindDeletables(c.oid));
-                }
-            }
-            (None, KeyCode::Enter, false) => {
-                if let Some(c) = self.history.commits.get(self.cursor) {
-                    self.command = Some(Command::Show(c.oid));
-                }
-            }
+            (None, KeyCode::Delete, false) => match self.history.commits.get(self.cursor) {
+                Some(c) if c.is_worktree() => self.message = Some("the working tree has no branches or tags".into()),
+                Some(c) => self.command = Some(Command::FindDeletables(c.oid)),
+                None => {}
+            },
+            (None, KeyCode::Enter, false) => self.diff_selected(true),
             (None, KeyCode::Char('?'), false) => self.help = Some(0),
             (None, KeyCode::Char('w'), false) => self.watch = !self.watch,
             (None, KeyCode::Char('^'), false) => {
@@ -594,7 +639,16 @@ impl App {
                 self.view.hiding = !self.view.hiding;
                 self.reload = true;
             }
-            (None, KeyCode::Char('d'), false) => self.diff_selected(),
+            (None, KeyCode::Char('d'), false) => self.diff_selected(false),
+            (None, KeyCode::Char('m'), false) => match self.history.commits.get(self.cursor) {
+                Some(c) if c.merge => self.command = Some(Command::Resolution(c.oid)),
+                Some(_) => self.message = Some("m: not a merge".into()),
+                None => {}
+            },
+            (None, KeyCode::Char('D'), false) => {
+                self.diff_tool = self.diff_tool.next();
+                self.command = Some(Command::SaveState);
+            }
             _ => {}
         }
         self.clamp();
@@ -797,6 +851,12 @@ impl App {
                 todo.extend(&commits[r].parents);
             }
         }
+        // The working tree stays when the head is HEAD, on which it sits.
+        for (r, c) in commits.iter().enumerate() {
+            if c.is_worktree() && c.parents.iter().any(|&p| keep[p]) {
+                keep[r] = true;
+            }
+        }
         keep
     }
 
@@ -839,15 +899,30 @@ impl App {
         }
     }
 
-    /// `d`: with exactly two commits selected, diffs from the second selected to the first.
-    fn diff_selected(&mut self) {
-        let rows = self.selection();
-        let oids: Vec<_> = rows.iter().filter_map(|&r| self.history.commits.get(r)).map(|c| c.oid).collect();
-        match (oids.as_slice(), self.visual.is_some() || !self.marks.is_empty()) {
-            ([first, second], true) => self.command = Some(Command::Diff(*second, *first)),
-            (_, true) => self.message = Some(format!("d diffs two selected commits; {} are selected", oids.len())),
-            (_, false) => self.message = Some("d diffs two selected commits: mark them with Space".into()),
+    /// `d` and Enter: diffs the two selected commits, or the one selected and the cursor's
+    /// (selected first); with none selected, or only the cursor's, shows the cursor's commit.
+    /// Enter (`with_cursor`) counts the cursor's commit as selected, after the others.
+    fn diff_selected(&mut self, with_cursor: bool) {
+        let Some(cursor) = self.history.commits.get(self.cursor).map(|c| c.oid) else { return };
+        let mut rows = match self.visual {
+            Some(anchor) => self.visual_rows(anchor),
+            None => self.marks.clone(),
+        };
+        if with_cursor && !rows.contains(&self.cursor) {
+            rows.push(self.cursor);
         }
+        let oids: Vec<_> = rows.iter().filter_map(|&r| self.history.commits.get(r)).map(|c| c.oid).collect();
+        self.command = match *oids.as_slice() {
+            [] => Some(Command::Show(cursor)),
+            [one] if one == cursor => Some(Command::Show(cursor)),
+            [one] => Some(Command::Diff(one, cursor)),
+            [first, second] => Some(Command::Diff(first, second)),
+            _ => {
+                let counted = if with_cursor { ", counting the cursor's" } else { "" };
+                self.message = Some(format!("a diff takes two commits; {} are selected{counted}", oids.len()));
+                None
+            }
+        };
     }
 
     /// `x`: adds the refs on the selected commits to the hidden ones (a detached HEAD stays),
@@ -918,7 +993,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &id)| Commit {
-                oid: git2::Oid::from_bytes(&[id; 20]).unwrap(),
+                // Never all zeros, which is the working tree's id.
+                oid: git2::Oid::from_bytes(&[[id; 19].as_slice(), &[0xee]].concat()).unwrap(),
                 parents: if i + 1 < ids.len() { vec![i + 1] } else { vec![] },
                 author: String::new(),
                 date: String::new(),
@@ -989,6 +1065,53 @@ mod tests {
         assert_eq!((a.cursor, a.offset), (16, 16));
         ctrl(&mut a, 'b');
         assert_eq!((a.cursor, a.offset), (15, 6));
+    }
+
+    #[test]
+    fn starts_on_the_worktree_above_the_head() {
+        let make = |worktree: bool| {
+            let mut h = history(&[1, 2, 3]);
+            h.head = Some(1);
+            if worktree {
+                h.commits[0].oid = repo::worktree_id();
+                h.commits[0].time = 10;
+            }
+            h
+        };
+        let a = App::new(make(false), View::default());
+        assert_eq!(a.cursor, 1, "no working tree: on HEAD");
+        let a = App::new(make(true), View::default());
+        assert_eq!((a.cursor, a.offset, a.head_row), (0, 0, Some(1)), "on the working tree; HEAD stays the head");
+        // Laid out around another commit: on that one.
+        let third = make(true).commits[2].oid;
+        let a = App::new(make(true), View { head: Some(third), ..View::default() });
+        assert_eq!(a.cursor, 2);
+    }
+
+    #[test]
+    fn merges_on_screen_are_asked_once() {
+        let mut h = history(&(0..30).collect::<Vec<u8>>());
+        for r in [2, 5, 25] {
+            h.commits[r].merge = true;
+        }
+        let mut a = App::new(h, View::default());
+        a.height = 10;
+        let oid = |a: &App, r: usize| a.history.commits[r].oid;
+        assert_eq!(a.merges_to_classify(), [oid(&a, 2), oid(&a, 5)], "only those on screen");
+        assert!(a.merges_to_classify().is_empty(), "asked already");
+        assert!(a.classifying());
+        a.merge_classified(oid(&a, 2), MergeKind::Forced);
+        a.merge_classified(oid(&a, 5), MergeKind::Resolved);
+        assert!(!a.classifying());
+        keys(&mut a, "G");
+        assert_eq!(a.merges_to_classify(), [oid(&a, 25)]);
+        keys(&mut a, "gg");
+        assert!(a.merges_to_classify().is_empty(), "remembered");
+
+        keys(&mut a, "6Gm");
+        assert_eq!(a.command.take(), Some(Command::Resolution(oid(&a, 5))));
+        keys(&mut a, "5Gm");
+        assert_eq!((a.command.take(), a.message.as_deref()), (None, Some("m: not a merge")));
     }
 
     #[test]
@@ -1167,11 +1290,12 @@ mod tests {
         keys(&mut a, "N");
         assert_eq!(a.cursor, 1);
 
-        // Fuzzy by default; exact and case-sensitive by toggles.
+        // Exact by default; fuzzy and case-sensitive by toggles.
         keys(&mut a, "/fxlx");
+        assert_eq!(a.search_hits, 0);
+        a.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         assert_eq!(a.search_hits, 1);
         a.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        assert_eq!(a.search_hits, 0);
         a.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         keys(&mut a, "Fix");
         assert_eq!(a.search_hits, 2);
@@ -1336,20 +1460,48 @@ mod tests {
         assert_eq!((a.view.deleted, a.reload), (repo::Deleted::Reflog, true));
         let oid = |a: &App, r: usize| a.history.commits[r].oid;
 
-        keys(&mut a, "d");
-        assert_eq!(a.command, None, "nothing selected");
-        // Marked 8, then 3: the diff goes from 3 to 8.
-        keys(&mut a, "8G 3G d");
-        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 2), oid(&a, 7))));
+        // Nothing selected: the cursor's commit, as Enter shows it.
+        keys(&mut a, "4Gd");
+        assert_eq!(a.command.take(), Some(Command::Show(oid(&a, 3))));
+        // One marked: it and the cursor's, the marked one first.
+        keys(&mut a, "8G 3Gd");
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 7), oid(&a, 2))));
+        // Only the cursor's own commit marked: as Enter.
+        keys(&mut a, "U5G kd");
+        assert_eq!(a.command.take(), Some(Command::Show(oid(&a, 4))));
+        // Marked 8, then 3: in that order (main.rs picks the direction).
+        keys(&mut a, "U8G 3G d");
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 7), oid(&a, 2))));
         assert_eq!(a.marks, vec![7, 2]);
         // A third mark: no diff.
         keys(&mut a, "5G d");
         assert_eq!(a.command, None);
         assert!(a.message.is_some());
 
-        // A visual range of two goes to where it started.
+        // A visual range of two, from where it started.
         keys(&mut a, "U6Gvkd");
-        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 4), oid(&a, 5))));
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 5), oid(&a, 4))));
+
+        // Enter counts the cursor's commit as selected.
+        special(&mut a, KeyCode::Esc);
+        special(&mut a, KeyCode::Enter);
+        assert_eq!(a.command.take(), Some(Command::Show(oid(&a, 4))), "nothing selected but the cursor's");
+        keys(&mut a, "8G 3G");
+        special(&mut a, KeyCode::Enter);
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 7), oid(&a, 2))));
+        keys(&mut a, "U8G 3G 5G");
+        special(&mut a, KeyCode::Enter);
+        assert_eq!(a.command.take(), None, "two marked and the cursor's: three");
+        assert!(a.message.as_ref().is_some_and(|m| m.contains("3 are selected")));
+        keys(&mut a, "3G");
+        special(&mut a, KeyCode::Enter);
+        assert_eq!(a.command.take(), Some(Command::Diff(oid(&a, 7), oid(&a, 2))), "the cursor's is marked already");
+        keys(&mut a, "U");
+
+        // D switches the tool and asks for it to be saved.
+        assert_eq!(a.diff_tool, DiffTool::Diffnav);
+        keys(&mut a, "D");
+        assert_eq!((a.diff_tool, a.command.take()), (DiffTool::Difft, Some(Command::SaveState)));
     }
 
     #[test]
@@ -1379,6 +1531,10 @@ mod tests {
         keys(&mut a, "2G");
         special(&mut a, KeyCode::Delete);
         assert_eq!(a.command.take(), Some(Command::FindDeletables(a.history.commits[1].oid)));
+        a.history.commits[1].oid = repo::worktree_id();
+        special(&mut a, KeyCode::Delete);
+        assert_eq!(a.command, None, "the working tree has nothing to delete");
+        a.history.commits[1].oid = a.history.commits[0].oid;
 
         let found = Deletables {
             entries: vec![

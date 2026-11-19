@@ -30,8 +30,65 @@ pub struct Commit {
 
 impl Commit {
     pub fn short_id(&self) -> String {
-        self.oid.to_string()[..7].to_string()
+        short(self.oid)
     }
+
+    /// Whether this is the working tree's row rather than a commit.
+    pub fn is_worktree(&self) -> bool {
+        is_worktree(self.oid)
+    }
+}
+
+/// What a merge commit did, worked out by merging its two parents again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeKind {
+    /// Could have been a fast-forward: the first parent is an ancestor of the second and the
+    /// merge has the second's tree. The commit is there only to show the merge.
+    Forced,
+    /// Both sides had changes, and the merge is exactly what merging them gives.
+    Clean,
+    /// The merge differs from what merging the parents gives: conflicts resolved by hand, or
+    /// other changes made in the merge commit itself (`git show --remerge-diff` shows them).
+    Resolved,
+    /// Not worked out: an octopus merge, or a commit that could not be read.
+    Unknown,
+}
+
+/// Works out what the merge `oid` did. Runs the merge in memory and writes nothing.
+pub fn merge_kind(repo: &Repository, oid: Oid) -> MergeKind {
+    classify(repo, oid).unwrap_or(MergeKind::Unknown)
+}
+
+fn classify(repo: &Repository, oid: Oid) -> Result<MergeKind> {
+    let merge = repo.find_commit(oid)?;
+    if merge.parent_count() != 2 {
+        return Ok(MergeKind::Unknown);
+    }
+    let (ours, theirs) = (merge.parent(0)?, merge.parent(1)?);
+    if repo.graph_descendant_of(theirs.id(), ours.id())? && theirs.tree_id() == merge.tree_id() {
+        return Ok(MergeKind::Forced);
+    }
+    let index = repo.merge_commits(&ours, &theirs, None)?;
+    if index.has_conflicts() {
+        return Ok(MergeKind::Resolved);
+    }
+    let diff = repo.diff_tree_to_index(Some(&merge.tree()?), Some(&index), None)?;
+    Ok(if diff.deltas().len() == 0 { MergeKind::Clean } else { MergeKind::Resolved })
+}
+
+/// The id of the working tree's row, which stands for the changes to tracked files not yet
+/// committed: all zeros, as `git blame` shows lines not yet committed.
+pub fn worktree_id() -> Oid {
+    Oid::ZERO_SHA1
+}
+
+pub fn is_worktree(oid: Oid) -> bool {
+    oid.is_zero()
+}
+
+/// A commit's short hash, or `<WTREE>` (as long) for the working tree.
+pub fn short(oid: Oid) -> String {
+    if is_worktree(oid) { "<WTREE>".to_string() } else { oid.to_string()[..7].to_string() }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +256,8 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
     } else {
         repo.head().ok().and_then(|h| h.peel_to_commit().ok()).map(|c| c.id())
     };
+    // The working tree, shown on top of HEAD while tracked files have changes.
+    let changed = if head.is_some() { worktree_changes(&repo)? } else { 0 };
     let mut live_starts: Vec<Oid> = refs.iter().map(|(_, o)| *o).collect();
     live_starts.extend(head);
     let extra_starts = deleted_starts(&repo, &refs, head.is_some(), view.deleted)?;
@@ -214,13 +273,33 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
         // A reflog can name a commit that has since been pruned.
         let _ = walk.push(oid);
     }
-    let oids = walk.collect::<Result<Vec<Oid>, _>>()?;
+    let mut oids = walk.collect::<Result<Vec<Oid>, _>>()?;
+    if changed > 0 {
+        oids.push(worktree_id());
+    }
     let index: HashMap<Oid, usize> = oids.iter().enumerate().map(|(i, &o)| (o, i)).collect();
 
     let mut parents: Vec<Vec<usize>> = Vec::with_capacity(oids.len());
     let mut time: Vec<i64> = Vec::with_capacity(oids.len());
     let mut commits: Vec<Commit> = Vec::with_capacity(oids.len());
     for &oid in &oids {
+        if is_worktree(oid) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            parents.push(head.and_then(|h| index.get(&h).copied()).into_iter().collect());
+            time.push(now);
+            commits.push(Commit {
+                oid,
+                parents: Vec::new(),
+                author: repo.signature().ok().and_then(|s| s.name().ok().map(String::from)).unwrap_or_default(),
+                date: civil_date(now),
+                summary: format!("uncommitted changes: {changed} file{}", if changed == 1 { "" } else { "s" }),
+                time: now,
+                merge: false,
+                merged: 0,
+                deleted: false,
+            });
+            continue;
+        }
         let commit = repo.find_commit(oid)?;
         let mut ps: Vec<usize> = Vec::new();
         for p in commit.parent_ids() {
@@ -260,8 +339,13 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
         }
     }
 
-    let starts: Vec<usize> =
-        live_starts.iter().chain(&extra_starts).filter_map(|o| index.get(o).copied()).collect();
+    let worktree = [worktree_id()];
+    let starts: Vec<usize> = worktree
+        .iter()
+        .chain(&live_starts)
+        .chain(&extra_starts)
+        .filter_map(|o| index.get(o).copied())
+        .collect();
     // The chosen head if it is part of this history, else HEAD.
     let layout_head = [view.head, head].into_iter().flatten().find_map(|h| index.get(&h).copied());
     let rows = order::sort(&parents, &time, &starts, view.order, layout_head);
@@ -296,7 +380,9 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
     };
     if view.refs_only {
         let keep = view.head.and_then(|h| index.get(&h).copied());
-        history = simplify(&history, |r| history.decorations.contains_key(&r) || keep == Some(r));
+        history = simplify(&history, |r| {
+            history.decorations.contains_key(&r) || keep == Some(r) || history.commits[r].is_worktree()
+        });
     }
     Ok(history)
 }
@@ -438,6 +524,8 @@ fn fingerprint(repo: &Repository) -> Result<Fingerprint> {
             .unwrap_or_default()
     };
     out.push(("HEAD".to_string(), target(&head)));
+    // Not a ref, but its row comes and goes with it, and its summary counts the files.
+    out.push(("WORKTREE".to_string(), worktree_changes(repo)?.to_string()));
     for reference in repo.references()? {
         let reference = reference?;
         let name = String::from_utf8_lossy(reference.name_bytes()).into_owned();
@@ -448,6 +536,29 @@ fn fingerprint(repo: &Repository) -> Result<Fingerprint> {
     }
     out.sort();
     Ok(out)
+}
+
+/// How many tracked files differ from HEAD, staged or not (`git diff HEAD --stat`, counting
+/// a submodule only when its commit changed, as `--ignore-submodules=dirty` does). 0 in a bare
+/// repository or without a HEAD commit.
+fn worktree_changes(repo: &Repository) -> Result<usize> {
+    if repo.is_bare() {
+        return Ok(0);
+    }
+    let Ok(tree) = repo.head().and_then(|h| h.peel_to_tree()) else { return Ok(0) };
+    // Submodules are left to the loop below: libgit2 would look inside each one for changes,
+    // which takes long in a big one and is not what counts here.
+    let mut options = git2::DiffOptions::new();
+    options.ignore_submodules(true);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
+    let mut changed = diff.deltas().count();
+    for sub in repo.submodules().unwrap_or_default() {
+        let recorded = sub.head_id();
+        if sub.workdir_id().is_some_and(|w| Some(w) != recorded) || sub.index_id() != recorded {
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
 /// Extra starting points for the commits no ref reaches.
@@ -581,6 +692,107 @@ mod tests {
     fn commit(dir: &Path, msg: &str, date: &str) {
         let env = [("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)];
         git_env(dir, &["commit", "-q", "--allow-empty", "-m", msg], &env);
+    }
+
+    #[test]
+    fn merge_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let write = |file: &str, text: &str| std::fs::write(d.join(file), text).unwrap();
+        let rev = |r: &str| Oid::from_str(git(d, &["rev-parse", r]).trim()).unwrap();
+        git(d, &["init", "-q", "-b", "main"]);
+        write("a", "1\n2\n3\n");
+        git(d, &["add", "a"]);
+        commit(d, "base", "2024-01-01T10:00:00+00:00");
+        let base = rev("HEAD");
+        let branch = |name: &str, file: &str, text: &str| {
+            git(d, &["checkout", "-q", "-b", name, &base.to_string()]);
+            write(file, text);
+            git(d, &["add", file]);
+            commit(d, name, "2024-01-02T10:00:00+00:00");
+        };
+        let merge = |into: &str, from: &str| {
+            git(d, &["checkout", "-q", into]);
+            git_env(d, &["merge", "-q", "--no-ff", "-m", "m", from], &[]);
+            rev("HEAD")
+        };
+        let repo = Repository::open(d).unwrap();
+
+        branch("feat", "b", "b\n");
+        branch("t1", "c", "c\n");
+        let forced = merge("t1", "feat");
+        // Could have fast-forwarded if t1 had stayed at base:
+        git(d, &["checkout", "-q", "-b", "t2", &base.to_string()]);
+        let forced = [forced, merge("t2", "feat")];
+        assert_eq!(merge_kind(&repo, forced[0]), MergeKind::Clean, "t1 had its own commit");
+        assert_eq!(merge_kind(&repo, forced[1]), MergeKind::Forced);
+
+        // A conflict, resolved by hand.
+        branch("x", "a", "1\nx\n3\n");
+        branch("y", "a", "1\ny\n3\n");
+        git(d, &["checkout", "-q", "y"]);
+        let out = std::process::Command::new("git")
+            .args(["merge", "-q", "x"])
+            .current_dir(d)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs([("GIT_AUTHOR_NAME", "T"), ("GIT_AUTHOR_EMAIL", "t@e"), ("GIT_COMMITTER_NAME", "T"), ("GIT_COMMITTER_EMAIL", "t@e")])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "it conflicts");
+        write("a", "1\nxy\n3\n");
+        git(d, &["add", "a"]);
+        commit(d, "resolved", "2024-01-03T10:00:00+00:00");
+        assert_eq!(merge_kind(&repo, rev("HEAD")), MergeKind::Resolved);
+
+        // Fast-forward possible, but the merge commit changed something itself.
+        git(d, &["checkout", "-q", "-b", "t3", &base.to_string()]);
+        git(d, &["merge", "-q", "--no-ff", "--no-commit", "feat"]);
+        write("extra", "e\n");
+        git(d, &["add", "extra"]);
+        commit(d, "evil", "2024-01-04T10:00:00+00:00");
+        assert_eq!(merge_kind(&repo, rev("HEAD")), MergeKind::Resolved);
+
+        assert_eq!(merge_kind(&repo, base), MergeKind::Unknown, "not a merge");
+    }
+
+    #[test]
+    fn worktree_row_on_top_of_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("a"), "one\n").unwrap();
+        git(d, &["add", "a"]);
+        commit(d, "A", "2024-01-01T10:00:00+00:00");
+        commit(d, "B", "2024-01-02T10:00:00+00:00");
+        let clean = load(d, &View::default()).unwrap();
+        assert!(!clean.commits.iter().any(Commit::is_worktree));
+
+        // Untracked files do not count.
+        std::fs::write(d.join("new"), "x").unwrap();
+        assert_eq!(current_fingerprint(d).unwrap(), clean.fingerprint);
+        assert!(!load(d, &View::default()).unwrap().commits.iter().any(Commit::is_worktree));
+
+        // A changed tracked file, and a staged new one.
+        std::fs::write(d.join("a"), "two\n").unwrap();
+        git(d, &["add", "new"]);
+        assert_ne!(current_fingerprint(d).unwrap(), clean.fingerprint, "watching sees it");
+        for order in [Order::Topo, Order::Date, Order::GitTopo] {
+            let h = load(d, &View { order, ..View::default() }).unwrap();
+            let w = h.commits.iter().position(Commit::is_worktree).expect("a worktree row");
+            assert_eq!(h.commits[w].parents, [h.head.unwrap()], "{order:?}: on top of HEAD");
+            assert_eq!(h.commits[w].short_id(), "<WTREE>");
+            assert_eq!(h.commits[w].summary, "uncommitted changes: 2 files");
+            assert!(!h.commits[w].deleted);
+            assert_eq!(h.commits.len(), 3);
+        }
+        let only_refs = load(d, &View { refs_only: true, ..View::default() }).unwrap();
+        assert!(only_refs.commits[0].is_worktree() && only_refs.commits[0].parents == [1]);
+
+        // Committed: gone again.
+        git(d, &["add", "a"]);
+        commit(d, "C", "2024-01-03T10:00:00+00:00");
+        assert!(!load(d, &View::default()).unwrap().commits.iter().any(Commit::is_worktree));
     }
 
     #[test]
@@ -846,7 +1058,7 @@ fn order_matches_git_in_real_repo() {
         args.extend(extra);
         let out = std::process::Command::new("git").args(&args).current_dir(path).output().unwrap();
         let theirs: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect();
-        let ours: Vec<String> = h.commits.iter().map(|c| c.oid.to_string()).collect();
+        let ours: Vec<String> = h.commits.iter().filter(|c| !c.is_worktree()).map(|c| c.oid.to_string()).collect();
         let first = ours.iter().zip(&theirs).position(|(a, b)| a != b);
         assert_eq!(first, None, "{extra:?}: first difference at row {first:?}");
         assert_eq!(ours.len(), theirs.len(), "{extra:?}");
