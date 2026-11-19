@@ -98,11 +98,12 @@ pub enum RefKind {
     Remote,
     Tag,
     Other,
+    /// A working tree of the repository (the one shown too), at this commit.
+    Worktree,
 }
 
 #[derive(Clone)]
 pub struct Decoration {
-    #[allow(dead_code)] // for colouring refs by kind later
     pub kind: RefKind,
     pub name: String,
     /// The ref it shows, by full name: the branch for `HEAD -> main`, none for a detached HEAD.
@@ -258,8 +259,12 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
     };
     // The working tree, shown on top of HEAD while tracked files have changes.
     let changed = if head.is_some() { worktree_changes(&repo)? } else { 0 };
+    let worktrees = worktrees(&repo);
     let mut live_starts: Vec<Oid> = refs.iter().map(|(_, o)| *o).collect();
     live_starts.extend(head);
+    // The other worktrees' HEADs, as `git log --all` takes them: a detached one may be on a
+    // commit no ref reaches. This one's is HEAD, which may be hidden.
+    live_starts.extend(worktrees.iter().filter(|w| !w.current).map(|w| w.head));
     let extra_starts = deleted_starts(&repo, &refs, head.is_some(), view.deleted)?;
 
     let mut walk = repo.revwalk()?;
@@ -372,7 +377,7 @@ pub fn load(path: &Path, view: &View) -> Result<History> {
         })
         .collect();
     let mut history = History {
-        decorations: decorations(&repo, decorated, head, &index),
+        decorations: decorations(&repo, decorated, head, &worktrees, &index),
         head: head.and_then(|h| index.get(&h).copied()),
         commits,
         fingerprint,
@@ -526,6 +531,9 @@ fn fingerprint(repo: &Repository) -> Result<Fingerprint> {
     out.push(("HEAD".to_string(), target(&head)));
     // Not a ref, but its row comes and goes with it, and its summary counts the files.
     out.push(("WORKTREE".to_string(), worktree_changes(repo)?.to_string()));
+    for w in worktrees(repo) {
+        out.push((format!("worktree {}", w.name), w.head.to_string()));
+    }
     for reference in repo.references()? {
         let reference = reference?;
         let name = String::from_utf8_lossy(reference.name_bytes()).into_owned();
@@ -536,6 +544,16 @@ fn fingerprint(repo: &Repository) -> Result<Fingerprint> {
     }
     out.sort();
     Ok(out)
+}
+
+/// The working tree at `path`: how many tracked files differ from its HEAD (as
+/// `worktree_changes` counts them), and how many files are untracked (not ignored).
+pub fn worktree_state(path: &Path) -> Result<(usize, usize)> {
+    let repo = Repository::open(path)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false).exclude_submodules(true);
+    let untracked = repo.statuses(Some(&mut options))?.iter().filter(|s| s.status().contains(git2::Status::WT_NEW)).count();
+    Ok((worktree_changes(&repo)?, untracked))
 }
 
 /// How many tracked files differ from HEAD, staged or not (`git diff HEAD --stat`, counting
@@ -600,10 +618,80 @@ fn deleted_starts(
 
 /// Groups the refs by commit. Git lists them in reverse name order, with HEAD first and
 /// merged with the branch it points at (`HEAD -> main`).
+/// A working tree of the repository, as `worktrees` finds it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Worktree {
+    /// What to call it: its path inside the main one, else its path (`~` for the home
+    /// directory).
+    pub name: String,
+    /// The commit its HEAD is at.
+    pub head: Oid,
+    /// It is the one gitnav looks at, whose HEAD is `HEAD`.
+    pub current: bool,
+    /// It is the main working tree, which `git worktree remove` does not remove.
+    pub main: bool,
+    pub path: std::path::PathBuf,
+    /// The branch checked out there (`refs/heads/…`), unless its HEAD is detached.
+    pub branch: Option<String>,
+}
+
+/// The repository's working trees that exist (`git worktree list`), the main one and the one
+/// gitnav looks at included.
+pub fn worktrees(repo: &Repository) -> Vec<Worktree> {
+    let here = repo.workdir().map(normal);
+    // The main working tree: the common git directory's parent, unless the repository is bare.
+    let common = repo.commondir().to_path_buf();
+    let main = Repository::open(&common).ok().filter(|r| !r.is_bare()).and_then(|r| r.workdir().map(normal));
+    let home = std::env::var_os("HOME").map(|h| normal(Path::new(&h)));
+    let name = |path: &Path| -> String {
+        if let Some(rest) = main.as_ref().and_then(|m| path.strip_prefix(m).ok()).filter(|r| !r.as_os_str().is_empty()) {
+            return rest.display().to_string();
+        }
+        match home.as_ref().and_then(|h| path.strip_prefix(h).ok()) {
+            Some(rest) => format!("~/{}", rest.display()),
+            None => path.display().to_string(),
+        }
+    };
+    // Its HEAD's commit, and the branch if HEAD is one.
+    let head_of = |path: &Path| -> Option<(Oid, Option<String>)> {
+        let wt = Repository::open(path).ok()?;
+        let head = wt.head().ok()?;
+        let branch = if head.is_branch() { head.name().ok().map(str::to_owned) } else { None };
+        Some((head.peel_to_commit().ok()?.id(), branch))
+    };
+
+    let mut out = Vec::new();
+    let mut add = |path: &Path, is_main: bool| {
+        if let Some((head, branch)) = head_of(path) {
+            let current = Some(path) == here.as_deref();
+            out.push(Worktree { name: name(path), head, current, main: is_main, path: path.to_path_buf(), branch });
+        }
+    };
+    if let Some(main) = main.as_ref() {
+        add(main, true);
+    }
+    let names = repo.worktrees().map(|n| n.iter().flatten().flatten().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    for wt in names.iter().filter_map(|n| repo.find_worktree(n).ok()) {
+        let path = normal(wt.path());
+        if wt.validate().is_ok() {
+            add(&path, false);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A path without a trailing separator, symlinks resolved where it exists.
+fn normal(path: &Path) -> std::path::PathBuf {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.components().collect()
+}
+
 fn decorations(
     repo: &Repository,
     mut refs: Vec<(String, Oid)>,
     head: Option<Oid>,
+    worktrees: &[Worktree],
     index: &HashMap<Oid, usize>,
 ) -> HashMap<usize, Vec<Decoration>> {
     refs.sort();
@@ -632,6 +720,11 @@ fn decorations(
         let full = Some(name.clone());
         let (kind, name) = short_name(name);
         out.entry(row).or_default().push(Decoration { kind, name, full });
+    }
+    for w in worktrees {
+        let Some(&row) = index.get(&w.head) else { continue };
+        let name = format!("WT: {}", w.name);
+        out.entry(row).or_default().push(Decoration { kind: RefKind::Worktree, name, full: None });
     }
     out
 }
@@ -692,6 +785,60 @@ mod tests {
     fn commit(dir: &Path, msg: &str, date: &str) {
         let env = [("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)];
         git_env(dir, &["commit", "-q", "--allow-empty", "-m", msg], &env);
+    }
+
+    #[test]
+    fn worktrees_are_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = top.join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        commit(&main, "A", "2024-01-01T10:00:00+00:00");
+        git(&main, &["branch", "feat"]);
+        commit(&main, "B", "2024-01-02T10:00:00+00:00");
+        let wt = |args: &[&str]| git(&main, &[&["worktree", "add", "-q"], args].concat());
+        wt(&[top.join("wt1").to_str().unwrap(), "feat"]);
+        wt(&["--detach", top.join("wt2").to_str().unwrap()]);
+        wt(&[main.join("wt_inner").to_str().unwrap(), "-b", "inner"]);
+        // A commit in the detached worktree, which no ref reaches.
+        commit(&top.join("wt2"), "C", "2024-01-03T10:00:00+00:00");
+
+        let worktrees = |h: &History| -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = h
+                .decorations
+                .iter()
+                .flat_map(|(&r, ds)| ds.iter().filter(|d| d.kind == RefKind::Worktree).map(move |d| (h.commits[r].summary.clone(), d.name.clone())))
+                .collect();
+            out.sort();
+            out
+        };
+        let h = load(&main, &View::default()).unwrap();
+        let path = |p: &Path| p.display().to_string();
+        assert_eq!(
+            worktrees(&h),
+            [
+                ("A".to_string(), format!("WT: {}", path(&top.join("wt1")))),
+                ("B".to_string(), format!("WT: {}", path(&main))),
+                ("B".to_string(), "WT: wt_inner".to_string()),
+                ("C".to_string(), format!("WT: {}", path(&top.join("wt2")))),
+            ]
+        );
+        let c = h.commits.iter().find(|c| c.summary == "C").unwrap();
+        assert!(!c.deleted, "a worktree's HEAD is live");
+        assert!(h.decorations.values().flatten().filter(|d| d.kind == RefKind::Worktree).all(|d| d.full.is_none()), "x cannot hide them");
+
+        // Seen from a linked worktree: the same list.
+        let from_wt1 = worktrees(&load(&top.join("wt1"), &View::default()).unwrap());
+        assert_eq!(from_wt1, worktrees(&h));
+
+        // Watching sees a worktree move; a deleted one is gone.
+        let before = current_fingerprint(&main).unwrap();
+        commit(&top.join("wt1"), "D", "2024-01-04T10:00:00+00:00");
+        assert_ne!(current_fingerprint(&main).unwrap(), before);
+        std::fs::remove_dir_all(top.join("wt2")).unwrap();
+        let h = load(&main, &View::default()).unwrap();
+        assert!(!worktrees(&h).iter().any(|(_, n)| n.ends_with("wt2")));
     }
 
     #[test]
@@ -878,8 +1025,9 @@ mod tests {
         for line in log.lines() {
             let f: Vec<&str> = line.split('\t').collect();
             let row = h.commits.iter().position(|c| c.oid.to_string() == f[0]).unwrap();
+            // Worktrees are ours; git's %D has no such thing.
             let decs = h.decorations.get(&row).map(|d| {
-                d.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+                d.iter().filter(|d| d.kind != RefKind::Worktree).map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
             });
             assert_eq!(decs.unwrap_or_default(), f[1], "decorations of {}", f[3]);
             assert_eq!(h.commits[row].date, f[2], "date of {}", f[3]);

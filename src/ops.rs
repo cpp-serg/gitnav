@@ -465,6 +465,17 @@ pub fn abort_rebase(path: &Path) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Deletion {
     LocalBranch(String),
+    /// A linked worktree, removed with everything in it (`git worktree remove --force`).
+    Worktree {
+        /// As `repo::Worktree` names it, and where it is.
+        name: String,
+        path: PathBuf,
+        /// The branch checked out there, if any: it can only be deleted with the worktree.
+        branch: Option<String>,
+        /// Tracked files with changes not committed, and untracked files, there: lost with it.
+        changed: usize,
+        untracked: usize,
+    },
     /// The branch on the remote (and with it the remote-tracking ref `remote/branch`).
     RemoteBranch { remote: String, branch: String },
     LocalTag(String),
@@ -476,10 +487,20 @@ impl Deletion {
     pub fn label(&self) -> (&'static str, String) {
         match self {
             Deletion::LocalBranch(b) => ("branch", b.clone()),
+            Deletion::Worktree { name, .. } => ("WT", name.clone()),
             Deletion::RemoteBranch { remote, branch } => ("remote branch", format!("{remote}/{branch}")),
             Deletion::LocalTag(t) => ("tag", t.clone()),
             Deletion::RemoteTag { remote, tag } => ("remote tag", format!("{tag} on {remote}")),
         }
+    }
+
+    /// Whether it removes a worktree whose tracked files have changes not committed.
+    pub fn loses_changes(&self) -> bool {
+        matches!(self, Deletion::Worktree { changed, .. } if *changed > 0)
+    }
+
+    pub fn is_worktree(&self) -> bool {
+        matches!(self, Deletion::Worktree { .. })
     }
 
     pub fn is_remote(&self) -> bool {
@@ -490,6 +511,8 @@ impl Deletion {
     fn name(&self) -> &str {
         match self {
             Deletion::LocalBranch(n) | Deletion::LocalTag(n) => n,
+            // Next to the branch checked out there.
+            Deletion::Worktree { branch: Some(n), .. } | Deletion::Worktree { name: n, .. } => n,
             Deletion::RemoteBranch { branch: n, .. } | Deletion::RemoteTag { tag: n, .. } => n,
         }
     }
@@ -515,6 +538,7 @@ pub fn deletables(path: &Path, oid: git2::Oid) -> Result<Deletables> {
     let mut entries = Vec::new();
     let mut notes = Vec::new();
     let mut tags = Vec::new();
+    let worktrees = crate::repo::worktrees(&repo);
     // remote/HEAD names each remote's default branch.
     let defaults: Vec<String> = repo
         .references_glob("refs/remotes/*/HEAD")?
@@ -533,8 +557,20 @@ pub fn deletables(path: &Path, oid: git2::Oid) -> Result<Deletables> {
                 continue;
             }
             let merged = head.is_some_and(|h| h == oid || repo.graph_descendant_of(h, oid).unwrap_or(false));
-            let warning = (!merged).then(|| "not merged into HEAD".to_string());
-            entries.push((Deletion::LocalBranch(branch.to_string()), warning));
+            let mut warnings: Vec<String> = Vec::new();
+            if !merged {
+                warnings.push("not merged into HEAD".into());
+            }
+            // Checked out in another worktree: it goes only with that worktree's entry.
+            match worktrees.iter().find(|w| !w.current && w.branch.as_deref() == Some(name.as_str())) {
+                Some(w) if w.main => {
+                    notes.push(format!("{branch} is checked out in the main worktree {}, which git does not remove", w.name));
+                    continue;
+                }
+                Some(w) => warnings.insert(0, format!("checked out in WT: {}, which goes too", w.name)),
+                None => {}
+            }
+            entries.push((Deletion::LocalBranch(branch.to_string()), (!warnings.is_empty()).then(|| warnings.join("; "))));
         } else if let Some(rest) = name.strip_prefix("refs/remotes/") {
             // remote/HEAD only says which branch is the remote's default.
             if reference.symbolic_target_bytes().is_some() {
@@ -548,6 +584,29 @@ pub fn deletables(path: &Path, oid: git2::Oid) -> Result<Deletables> {
             tags.push(tag.to_string());
         }
     }
+    // The linked worktrees here; not the main one, which git does not remove, nor this one.
+    for w in worktrees.iter().filter(|w| w.head == oid && !w.main && !w.current) {
+        let (changed, untracked) = match crate::repo::worktree_state(&w.path) {
+            Ok(state) => state,
+            Err(e) => {
+                notes.push(format!("WT: {} could not be checked: {e:#}", w.name));
+                continue;
+            }
+        };
+        let branch = w.branch.as_deref().and_then(|b| b.strip_prefix("refs/heads/")).map(str::to_owned);
+        let mut warnings = Vec::new();
+        if changed > 0 {
+            warnings.push(format!("UNCOMMITTED CHANGES IN {changed} TRACKED FILE{}", if changed == 1 { "" } else { "S" }));
+        }
+        if untracked > 0 {
+            warnings.push(format!("{untracked} untracked file{}", if untracked == 1 { "" } else { "s" }));
+        }
+        if let Some(b) = &branch {
+            warnings.push(format!("branch {b} is checked out here"));
+        }
+        let what = Deletion::Worktree { name: w.name.clone(), path: w.path.clone(), branch, changed, untracked };
+        entries.push((what, (!warnings.is_empty()).then(|| warnings.join("; "))));
+    }
     if !tags.is_empty() {
         for remote in remote_names(&repo) {
             match remote_tags(&dir, &remote, &tags) {
@@ -558,7 +617,8 @@ pub fn deletables(path: &Path, oid: git2::Oid) -> Result<Deletables> {
             }
         }
     }
-    entries.sort_by(|(a, _), (b, _)| (a.name(), a.is_remote(), a.label()).cmp(&(b.name(), b.is_remote(), b.label())));
+    let key = |d: &Deletion| (d.name().to_string(), d.is_remote(), d.is_worktree(), d.label());
+    entries.sort_by_key(|(d, _)| key(d));
     Ok(Deletables { entries, notes })
 }
 
@@ -623,6 +683,8 @@ pub fn delete(path: &Path, what: &Deletion) -> Result<String> {
     let (label, name) = what.label();
     let out = match what {
         Deletion::LocalBranch(b) => run(&["branch", "-D", b])?,
+        // --force: asked for, and needed anyway with submodules or untracked files there.
+        Deletion::Worktree { path, .. } => run(&["worktree", "remove", "--force", &path.to_string_lossy()])?,
         Deletion::LocalTag(t) => run(&["tag", "-d", t])?,
         Deletion::RemoteTag { remote, tag } => run(&["push", remote, "--delete", &format!("refs/tags/{tag}")])?,
         Deletion::RemoteBranch { remote, branch } => {
@@ -925,6 +987,47 @@ mod tests {
         let only = plain(&resolution(&mine, resolved, DiffTool::Git, 100).unwrap().unwrap());
         assert!(only.contains("x and y") && !only.contains("Changes against"), "{only}");
         assert!(resolution(&mine, rev("x"), DiffTool::Git, 100).is_err(), "not a merge");
+    }
+
+    #[test]
+    fn branches_in_worktrees() {
+        let (tmp, mine, _theirs) = setup();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        let head = Repository::open(&mine).unwrap().head().unwrap().target().unwrap();
+        let (clean, dirty) = (top.join("clean"), top.join("dirty"));
+        git(&mine, &["worktree", "add", "-q", clean.to_str().unwrap(), "-b", "c"]);
+        git(&mine, &["worktree", "add", "-q", dirty.to_str().unwrap(), "-b", "d"]);
+        std::fs::write(dirty.join("f"), "changed\n").unwrap();
+        std::fs::write(dirty.join("new"), "x").unwrap();
+
+        let found = deletables(&mine, head).unwrap();
+        let labels: Vec<(&str, String)> = found.entries.iter().map(|(d, _)| d.label()).collect();
+        let (c, d) = (clean.display().to_string(), dirty.display().to_string());
+        // Each branch, then the worktree it is checked out in.
+        let remote = ("remote branch", "origin/main".to_string());
+        assert_eq!(labels, [("branch", "c".to_string()), ("WT", c.clone()), ("branch", "d".to_string()), ("WT", d.clone()), remote]);
+        let warning = |i: usize| found.entries[i].1.clone().unwrap_or_default();
+        assert_eq!(warning(0), format!("checked out in WT: {c}, which goes too"));
+        assert!(matches!(&found.entries[1].0, Deletion::Worktree { changed: 0, untracked: 0, branch: Some(b), .. } if b == "c"));
+        assert!(!found.entries[1].0.loses_changes());
+        assert!(matches!(&found.entries[3].0, Deletion::Worktree { changed: 1, untracked: 1, .. }));
+        assert!(found.entries[3].0.loses_changes());
+        assert_eq!(warning(3), "UNCOMMITTED CHANGES IN 1 TRACKED FILE; 1 untracked file; branch d is checked out here");
+
+        // From a linked worktree: the main one's branch cannot go, nor this one's.
+        let from_clean = deletables(&clean, head).unwrap();
+        assert!(from_clean.notes.iter().any(|n| n.starts_with("main is checked out in the main worktree")), "{:?}", from_clean.notes);
+        assert!(from_clean.notes.iter().any(|n| n.starts_with("c is checked out;")), "its own: {:?}", from_clean.notes);
+        assert!(!from_clean.entries.iter().any(|(e, _)| e.label() == ("WT", c.clone())), "not the one gitnav is in");
+
+        // The worktree alone: changes and all; the branch stays.
+        assert_eq!(delete(&mine, &found.entries[3].0).unwrap(), format!("deleted WT {d}"));
+        assert!(!dirty.exists());
+        assert!(!git(&mine, &["worktree", "list"]).contains("dirty"));
+        assert_eq!(git(&mine, &["branch", "--list", "d"]).trim(), "d");
+        // Then the branch, no longer checked out anywhere.
+        delete(&mine, &found.entries[2].0).unwrap();
+        assert!(git(&mine, &["branch", "--list", "d"]).is_empty());
     }
 
     #[test]

@@ -7,8 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, DeleteDialog, Dialog, HELP, Prompt, PromptKind};
+use crate::ops::Deletion;
 use crate::matcher;
-use crate::repo::MergeKind;
+use crate::repo::{MergeKind, RefKind};
 
 /// Lane colours, in the order git cycles through them.
 const LANE_COLORS: [Color; crate::graph::COLORS as usize] = [
@@ -159,6 +160,9 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
 
 /// The delete checklist: one line per branch or tag, ticked or not, with the cursor on one.
 fn draw_delete(frame: &mut Frame, dialog: &DeleteDialog) {
+    if dialog.confirm {
+        return draw_delete_worktrees(frame, dialog);
+    }
     let kind_width = dialog.entries.iter().map(|(d, _, _)| d.label().0.len()).max().unwrap_or(0);
     let name_width = dialog.entries.iter().map(|(d, _, _)| d.label().1.chars().count()).max().unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
@@ -170,7 +174,18 @@ fn draw_delete(frame: &mut Frame, dialog: &DeleteDialog) {
             Span::styled(format!("{name:<name_width$}"), Style::new().add_modifier(Modifier::BOLD)),
         ];
         if let Some(warning) = warning {
-            spans.push(Span::styled(format!("  {warning}"), Style::new().fg(Color::Yellow)));
+            // Each part in its own style: what would be lost stands out.
+            for (k, part) in warning.split("; ").enumerate() {
+                spans.push(Span::styled(if k == 0 { "  " } else { "; " }, Style::new().fg(Color::Yellow)));
+                let style = if part.starts_with("UNCOMMITTED CHANGES") {
+                    LOUD
+                } else if part.contains("untracked file") {
+                    BRIGHT
+                } else {
+                    Style::new().fg(Color::Yellow)
+                };
+                spans.push(Span::styled(part.to_string(), style));
+            }
         }
         let mut line = Line::from(spans);
         if i == dialog.cursor {
@@ -196,6 +211,76 @@ fn draw_delete(frame: &mut Frame, dialog: &DeleteDialog) {
         .title(format!(" Delete at {} ", dialog.short))
         .title_bottom(Line::from(hint).right_aligned())
         .border_style(Style::new().fg(Color::LightRed));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// What must not be missed: uncommitted changes that a deletion would lose.
+const LOUD: Style = Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD);
+/// Lost as well, if less likely to matter: untracked files in a worktree that goes.
+const BRIGHT: Style = Style::new().fg(Color::Black).bg(Color::LightYellow).add_modifier(Modifier::BOLD);
+
+/// After Enter with worktrees ticked: each worktree that goes with its branch, and a red banner
+/// for any with uncommitted changes, which then take Y (shift) to delete.
+fn draw_delete_worktrees(frame: &mut Frame, dialog: &DeleteDialog) {
+    let chosen = dialog.chosen();
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+    let mut risky = false;
+    for what in &chosen {
+        let Deletion::Worktree { name, branch, changed, untracked, .. } = what else { continue };
+        lines.push(Line::from(vec![
+            Span::raw(" WT "),
+            Span::styled(name.clone(), Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" is removed, with everything in it."),
+        ]));
+        if let Some(b) = branch {
+            let goes = chosen.contains(&Deletion::LocalBranch(b.clone()));
+            lines.push(Line::from(vec![
+                Span::raw(" Branch "),
+                Span::styled(b.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(if goes { ", checked out there, is deleted too." } else { ", checked out there, stays." }),
+            ]));
+        }
+        if *changed > 0 {
+            risky = true;
+            let files = if *changed == 1 { "FILE" } else { "FILES" };
+            let text = format!("  ⚠  UNCOMMITTED CHANGES IN {changed} TRACKED {files} THERE WILL BE LOST  ⚠  ");
+            let blank = " ".repeat(text.chars().count());
+            lines.push(Line::raw(""));
+            for t in [blank.clone(), text, blank] {
+                lines.push(Line::from(vec![Span::raw(" "), Span::styled(t, LOUD)]));
+            }
+        }
+        if *untracked > 0 {
+            let files = if *untracked == 1 { "file" } else { "files" };
+            lines.push(Line::from(vec![Span::raw(" "), Span::styled(format!(" ALSO {untracked} UNTRACKED {} THERE ", files.to_uppercase()), BRIGHT)]));
+        }
+        lines.push(Line::raw(""));
+    }
+    // Branches checked out in a ticked worktree are named above already.
+    let named = |c: &Deletion| {
+        chosen.iter().any(|w| matches!((w, c), (Deletion::Worktree { branch: Some(w), .. }, Deletion::LocalBranch(b)) if w == b))
+    };
+    let others = chosen.iter().filter(|c| !c.is_worktree() && !named(c)).count();
+    if others > 0 {
+        lines.push(Line::raw(format!(" And {others} more ticked, deleted with them.")));
+        lines.push(Line::raw(""));
+    }
+    let hint = if risky { " Y (shift) delete them all  n back " } else { " y delete them all  n back " };
+    let width = lines.iter().map(Line::width).chain([hint.len() + 2]).max().unwrap_or(0) as u16 + 4;
+    let area = frame.area();
+    let height = lines.len() as u16 + 2;
+    let popup = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+    let title = if risky { " Remove worktrees with uncommitted changes? " } else { " Remove these worktrees? " };
+    let block = Block::bordered()
+        .title(Span::styled(title, if risky { LOUD } else { Style::new().fg(Color::LightRed) }))
+        .title_bottom(Line::from(hint).right_aligned())
+        .border_style(Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD));
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -317,11 +402,17 @@ fn commit_line(app: &App, row: usize) -> Line<'_> {
     spans.push(Span::raw(" "));
     spans.push(Span::styled("-", Style::new().fg(Color::White).add_modifier(Modifier::DIM)));
     if let Some(decs) = app.history.decorations.get(&row) {
-        let names: Vec<&str> = decs.iter().map(|d| d.name.as_str()).collect();
-        spans.push(Span::styled(
-            format!(" ({})", names.join(", ")),
-            Style::new().fg(Color::LightYellow).add_modifier(bold | Modifier::REVERSED),
-        ));
+        // As one badge, the worktrees in their own colour; the text is `History::line`'s.
+        let badge = |color: Color| Style::new().fg(color).add_modifier(bold | Modifier::REVERSED);
+        spans.push(Span::styled(" (", badge(Color::LightYellow)));
+        for (i, d) in decs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", badge(Color::LightYellow)));
+            }
+            let color = if d.kind == RefKind::Worktree { Color::LightCyan } else { Color::LightYellow };
+            spans.push(Span::styled(d.name.clone(), badge(color)));
+        }
+        spans.push(Span::styled(")", badge(Color::LightYellow)));
     }
     spans.push(Span::styled(format!("({})", c.author), Style::new().fg(Color::Blue)));
     if c.deleted {

@@ -41,15 +41,18 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
 - **`repo.rs`** walks all refs (except `refs/prefetch/*`) plus HEAD, optionally reflogs or every
   commit object (`Deleted`), sorts with `order::sort`, and builds `History` (commits with parents
   as row indices, git-`%D`-style decorations, a ref fingerprint, the HEAD row). While tracked
-  files differ from HEAD (`git diff HEAD`, submodules only by their commit), a `<WTREE>` row
-  with the all-zero id (`worktree_id`) sits on top of HEAD as its child; the fingerprint
-  counts those files, so watching adds and drops it. `ops::Change` turns it into `git diff`
-  against HEAD or another commit. `merge_kind` works out what a merge did (`MergeKind`: forced
-  where a fast-forward was possible, clean, or resolved by hand) by merging its parents again
-  in memory; nothing is written. libgit2's answers match `git show --remerge-diff` on ggsn. `simplify(history,
-  keep)` keeps a subset of rows and rejoins each kept commit to its nearest kept ancestors; real
-  parent edges are never pruned, only joins made across hidden commits. Refs-only, the text
-  filter and head-only all use it.
+  files differ from HEAD (`git diff HEAD`, submodules only by their commit), a `<WTREE>` row with
+  the all-zero id (`worktree_id`) sits on top of HEAD as its child; the fingerprint counts those
+  files, so watching adds and drops it. `ops::Change` turns it into `git diff` against HEAD or
+  another commit. The repository's worktrees (`worktrees`, the main one and the one shown
+  included) are starting points of the walk, as with `git log --all`, and decorate their HEAD
+  commits as `WT: <path>` (`RefKind::Worktree`, drawn in another colour; `full` is none, so `x`
+  leaves them). `merge_kind` works out what a merge did (`MergeKind`: forced where a fast-forward
+  was possible, clean, or resolved by hand) by merging its parents again in memory; nothing is
+  written. libgit2's answers match `git show --remerge-diff` on ggsn. `simplify(history, keep)`
+  keeps a subset of rows and rejoins each kept commit to its nearest kept ancestors; real parent
+  edges are never pruned, only joins made across hidden commits. Refs-only, the text filter and
+  head-only all use it.
 - **`order.rs`**: `GitTopo` and `Date` reproduce git's `revision.c` exactly (tests compare
   against `git log`). `Topo` is git's stack walk plus a search for the branch blocking the current
   line, so a blocked parent comes as soon as possible. Topo and Date begin with the layout head
@@ -86,17 +89,21 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   `commit_line` must concatenate to exactly that string (a test checks it), because highlight
   positions are character offsets into it. Anything drawn in addition (the merge count after
   the hash) is inserted after highlighting with `insert_at`.
-- **`ops.rs`** is the only place that runs the git CLI at runtime: pull with autostash and
-  rebase, and rebase abort (libgit2 has no equivalent with git's credential handling; `main.rs`
-  leaves the alternate screen while they run so git can prompt), a `Change` (one commit as
-  `git show`, or two as `git diff`) for Enter and `d`, and deleting branches and tags locally
-  and on remotes (Delete). A change goes to the `DiffTool` chosen with `D`: diffnav (run
-  outside the TUI), difftastic as git's external diff, or git through its configured pager; the
-  last two land in `app::Pager`, with colours that `ansi.rs` turns into styled lines. A tool
-  not on `PATH` falls back to git. `d` diffs from an ancestor to its descendant, else from the
-  second selected commit to the first (`diff_order`). Anything that talks to a remote while
-  the TUI owns the terminal goes through `ops::batch`, which stops git and ssh from prompting;
-  pushes run outside the TUI instead.
+- **`ops.rs`** is the only place that runs the git CLI at runtime: pull with autostash and rebase,
+  and rebase abort (libgit2 has no equivalent with git's credential handling; `main.rs` leaves the
+  alternate screen while they run so git can prompt), a `Change` (one commit as `git show`, or two
+  as `git diff`) for Enter and `d`, and deleting branches and tags locally and on remotes
+  (Delete). A change goes to the `DiffTool` chosen with `D`: diffnav (run outside the TUI),
+  difftastic as git's external diff, or git through its configured pager; the last two land in
+  `app::Pager`, with colours that `ansi.rs` turns into styled lines. A tool not on `PATH` falls
+  back to git. `d` diffs from an ancestor to its descendant, else from the second selected commit
+  to the first (`diff_order`). Linked worktrees at the commit are entries of their own
+  (`Deletion::Worktree`, `git worktree remove --force`); a branch checked out in one goes only
+  with it, so ticking the branch ticks the worktree and unticking the worktree unticks the branch,
+  and worktrees are removed first. Ticked worktrees bring a second question; uncommitted tracked
+  changes there show in red and take `Y` (shift). Anything that talks to a remote while the TUI
+  owns the terminal goes through `ops::batch`, which stops git and ssh from prompting; pushes run
+  outside the TUI instead.
 - **`config.rs`**: settings come from the config file
   (`$XDG_CONFIG_HOME/gitnav/config.toml`), then `$GITNAV_OPTS`, then the command line, later
   winning (`--hide` patterns add up). A new option needs a `--x`/`--no-x` pair in `Cli`, a

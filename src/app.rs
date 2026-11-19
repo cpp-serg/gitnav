@@ -95,12 +95,36 @@ pub struct DeleteDialog {
     /// What cannot be deleted, or could not be checked.
     pub notes: Vec<String>,
     pub cursor: usize,
+    /// Enter was pressed with worktrees ticked: asking whether to delete them too.
+    pub confirm: bool,
 }
 
 impl DeleteDialog {
     pub fn new(short: String, found: crate::ops::Deletables) -> Self {
         let entries = found.entries.into_iter().map(|(d, w)| (d, w, false)).collect();
-        DeleteDialog { short, entries, notes: found.notes, cursor: 0 }
+        DeleteDialog { short, entries, notes: found.notes, cursor: 0, confirm: false }
+    }
+
+    /// The ticked entries, worktrees first: a branch checked out in one goes only after it.
+    pub fn chosen(&self) -> Vec<Deletion> {
+        let mut chosen: Vec<Deletion> = self.entries.iter().filter(|e| e.2).map(|e| e.0.clone()).collect();
+        chosen.sort_by_key(|d| !d.is_worktree());
+        chosen
+    }
+
+    /// Ticks or unticks entry `i`. A branch checked out in a worktree cannot go without it:
+    /// ticking the branch ticks the worktree, and unticking the worktree unticks the branch.
+    fn toggle(&mut self, i: usize) {
+        let Some(entry) = self.entries.get_mut(i) else { return };
+        entry.2 = !entry.2;
+        let (what, ticked) = (entry.0.clone(), entry.2);
+        for other in &mut self.entries {
+            match (&what, &other.0) {
+                (Deletion::LocalBranch(b), Deletion::Worktree { branch: Some(w), .. }) if ticked && b == w => other.2 = true,
+                (Deletion::Worktree { branch: Some(w), .. }, Deletion::LocalBranch(b)) if !ticked && b == w => other.2 = false,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -657,24 +681,41 @@ impl App {
     /// A key while the delete checklist is open; false when it closes. Enter with something
     /// ticked hands the ticked entries to `Command::Delete`.
     fn delete_key(&mut self, d: &mut DeleteDialog, key: KeyEvent) -> bool {
+        if d.confirm {
+            // Deleting worktrees: y, or Y when one has uncommitted changes, so that a y typed
+            // by habit cannot lose them.
+            let chosen = d.chosen();
+            let risky = chosen.iter().any(Deletion::loses_changes);
+            match key.code {
+                KeyCode::Char('Y') | KeyCode::Char('y') if !risky || key.code == KeyCode::Char('Y') => {
+                    self.deletions = chosen;
+                    self.command = Some(Command::Delete);
+                    return false;
+                }
+                KeyCode::Char('y') => self.message = Some("uncommitted changes would be lost: Y (shift) deletes anyway".into()),
+                KeyCode::Char('n' | 'q') | KeyCode::Esc => d.confirm = false,
+                _ => {}
+            }
+            return true;
+        }
         let last = d.entries.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return false,
             KeyCode::Char('j') | KeyCode::Down => d.cursor = (d.cursor + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => d.cursor = d.cursor.saturating_sub(1),
-            KeyCode::Char(' ') => {
-                if let Some(entry) = d.entries.get_mut(d.cursor) {
-                    entry.2 = !entry.2;
-                }
-            }
+            KeyCode::Char(' ') => d.toggle(d.cursor),
             KeyCode::Char('a') => {
                 let all = d.entries.iter().all(|e| e.2);
                 d.entries.iter_mut().for_each(|e| e.2 = !all);
             }
             KeyCode::Enter => {
-                let chosen: Vec<Deletion> = d.entries.iter().filter(|e| e.2).map(|e| e.0.clone()).collect();
+                let chosen = d.chosen();
                 if chosen.is_empty() {
                     self.message = Some("nothing ticked: Space ticks, Esc cancels".into());
+                    return true;
+                }
+                if chosen.iter().any(Deletion::is_worktree) {
+                    d.confirm = true;
                     return true;
                 }
                 self.deletions = chosen;
@@ -1553,6 +1594,55 @@ mod tests {
         assert!(a.delete.is_none());
         assert_eq!(a.command, Some(Command::Delete));
         assert_eq!(a.deletions, [Deletion::LocalBranch("feat".into()), Deletion::LocalTag("v1".into())]);
+
+        // A branch in a worktree: Enter asks again; with uncommitted changes there, only Y.
+        a.command = None;
+        let in_worktree = |changed| Deletion::Worktree {
+            name: "wt".into(),
+            path: "/x/wt".into(),
+            branch: Some("feat".into()),
+            changed,
+            untracked: 0,
+        };
+        for (changed, key, deletes) in [(0, 'y', true), (2, 'y', false), (2, 'Y', true)] {
+            let found = Deletables { entries: vec![(in_worktree(changed), None)], notes: vec![] };
+            a.delete = Some(DeleteDialog::new("0101010".into(), found));
+            keys(&mut a, " ");
+            special(&mut a, KeyCode::Enter);
+            assert!(a.delete.as_ref().unwrap().confirm && a.command.is_none(), "asks first");
+            keys(&mut a, &key.to_string());
+            assert_eq!(a.command.take().is_some(), deletes, "{changed} changed, {key}");
+            if !deletes {
+                assert!(a.message.as_ref().unwrap().contains("Y (shift)"));
+                keys(&mut a, "n");
+                let d = a.delete.as_ref().unwrap();
+                assert!(!d.confirm && d.entries[0].2, "back to the list, still ticked");
+            }
+        }
+        // Ticking a branch ticks the worktree it is checked out in; unticking that unticks it.
+        let found = Deletables {
+            entries: vec![(Deletion::LocalBranch("feat".into()), None), (in_worktree(0), None), (Deletion::LocalTag("v1".into()), None)],
+            notes: vec![],
+        };
+        a.delete = Some(DeleteDialog::new("0101010".into(), found));
+        let ticks = |a: &App| a.delete.as_ref().unwrap().entries.iter().map(|e| e.2).collect::<Vec<_>>();
+        keys(&mut a, " ");
+        assert_eq!(ticks(&a), [true, true, false]);
+        keys(&mut a, "j ");
+        assert_eq!(ticks(&a), [false, false, false]);
+        keys(&mut a, " ");
+        assert_eq!(ticks(&a), [false, true, false], "the worktree alone");
+        special(&mut a, KeyCode::Enter);
+        keys(&mut a, "y");
+        assert_eq!(a.command.take(), Some(Command::Delete));
+        assert_eq!(a.deletions, [in_worktree(0)]);
+        // Both: the worktree goes first.
+        a.delete = Some(DeleteDialog::new("0101010".into(), Deletables { entries: vec![(Deletion::LocalBranch("feat".into()), None), (in_worktree(0), None)], notes: vec![] }));
+        keys(&mut a, " ");
+        special(&mut a, KeyCode::Enter);
+        keys(&mut a, "y");
+        assert_eq!(a.deletions, [in_worktree(0), Deletion::LocalBranch("feat".into())]);
+        a.command = None;
 
         a.delete = Some(DeleteDialog::new("0101010".into(), Deletables { entries: vec![(Deletion::LocalTag("v1".into()), None)], notes: vec![] }));
         keys(&mut a, "a");
