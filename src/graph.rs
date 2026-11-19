@@ -138,9 +138,12 @@ pub fn layout<'a>(
         if p >= all.len() || is_heavy(p) || spine_next.contains_key(&p) { p } else { line_end[p] }
     };
     // The first column a line outside the head's history may take, starting at `row` and
-    // heading for `p`. Without a spine there is no head line to keep them next to.
+    // heading for `p`. Without a spine there is no head line to keep them next to. The row
+    // where the line ends does not count: it comes in from above, and the lines starting
+    // there leave below.
     let outer = |row: usize, p: usize| {
-        if spine.is_empty() { first_lane } else { first_lane + reserved.max(row, ends_at(p)) }
+        let last = ends_at(p).saturating_sub(1).max(row);
+        if spine.is_empty() { first_lane } else { first_lane + reserved.max(row, last) }
     };
 
     for (row, &parents) in all.iter().enumerate() {
@@ -231,9 +234,10 @@ pub fn layout<'a>(
                 }
                 continue;
             }
-            // A column freed on this row has its line turning into the commit, so skip those.
+            // A column whose line ended in this commit is free again: that line came in on the
+            // connector above, this one leaves on the one below.
             let from = if row_heavy { col + 1 } else { (col + 1).max(outer(row, p)) };
-            let free = (from..lanes.len()).find(|&j| lanes[j].is_none() && !hits.contains(&j));
+            let free = (from..lanes.len()).find(|&j| lanes[j].is_none());
             let j = free.unwrap_or_else(|| {
                 while lanes.len() < from {
                     lanes.push(None);
@@ -276,12 +280,24 @@ impl Reserved {
         spine_next: &std::collections::HashMap<usize, Option<usize>>,
     ) -> Self {
         let n = parents.len();
+        // The spine row the spine's lane waits for at each row off the spine: a line heading for
+        // that row joins it under its own row, and leaves no column open below.
+        let mut spine_waits = vec![None; n];
+        let mut waiting = None;
+        for (r, w) in spine_waits.iter_mut().enumerate() {
+            match spine_next.get(&r) {
+                Some(&next) => waiting = next,
+                None => *w = waiting,
+            }
+        }
         let mut diff = vec![0isize; n + 1];
         for (r, ps) in parents.iter().enumerate().filter(|&(r, _)| heavy.get(r).copied().unwrap_or(false)) {
-            // Rows r..p: at p the line ends in p's own lane.
+            // Rows r..p: at p the line ends in p's own lane. A line joining the spine's at once
+            // is there on row r only.
             for &p in ps.iter().filter(|&&p| p < n && spine_next.get(&r) != Some(&Some(p))) {
+                let end = if spine_waits[r] == Some(p) { r + 1 } else { p };
                 diff[r] += 1;
-                diff[p] -= 1;
+                diff[end] -= 1;
             }
         }
         let mut open = Vec::with_capacity(n);
@@ -743,6 +759,20 @@ mod tests {
     }
 
     #[test]
+    fn no_columns_left_empty() {
+        // 0 merges 1 into the spine; 2 merges 3..4 (in the head's history) into it; 5 is a tip
+        // outside it; all end on the spine at 6, itself a merge of 7. Nothing needs more than
+        // column 1.
+        let parents: &[&[usize]] = &[&[2, 1], &[2], &[6, 3], &[4], &[6], &[6], &[8, 7], &[8], &[]];
+        let heavy = [true, true, true, true, true, false, true, true, true];
+        let got = render_heavy(parents, &[0, 2, 6, 8], &heavy);
+        assert_eq!(
+            got,
+            ["●", "┃╲", "┃ ●", "┃╱", "●", "┃╲", "┃ ●", "┃ ●", "┃╱", "┃ ●", "┃╱", "●", "┃╲", "┃ ●", "┃╱", "●"]
+        );
+    }
+
+    #[test]
     fn long_reaches_are_staircases() {
         // The head 1 merges 3 (spine) and 2; the tip 0 passes by in column 2 and heads for 3
         // too. Its line leaves column 2 on 2's own line, beside the commit, and goes down one
@@ -750,10 +780,10 @@ mod tests {
         let heavy = [false, true, true, true];
         let got = render_heavy(&[&[3], &[3, 2], &[3], &[]], &[1, 3], &heavy);
         assert_eq!(got, ["    ●", "●   │", "┃╲  │", "┃ ●╱", "┃╱╱", "┃╱", "●"]);
-        // Three columns: more connector lines.
-        let heavy = [false, true, true, true, true];
-        let got = render_heavy(&[&[4], &[4, 2], &[4], &[4], &[]], &[1, 4], &heavy);
-        assert_eq!(got[5..], ["┃ ●  ╱", "┃╱  ╱", "┃  ╱", "┃ ╱", "┃╱", "●"]);
+        // Three columns: more connector lines, beside another staircase.
+        let heavy = [false, true, true, true, true, true];
+        let got = render_heavy(&[&[5], &[5, 2], &[5, 3], &[4], &[5], &[]], &[1, 5], &heavy);
+        assert_eq!(got[5..], ["┃   ● │", "┃   ●╱", "┃  ╱╱", "┃ ╱╱", "┃╱╱", "┃╱", "●"]);
     }
 
     #[test]

@@ -59,15 +59,17 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   connector lines where lines change column, as in `git log --graph` (`╲`/`╱` for a step to the
   next column; a longer reach is a staircase, one character sideways per line, which a line
   passing by may begin on the commit's line beside its column; git's `_` run only where a
-  staircase would cut through another line). `connector` repeats until its height settles,
-  since a reach falling back to a run needs fewer lines. Lanes keep their column; the only
-  sideways move is the step a line takes to make room
-  for a merge's source next to its target. Inputs besides the parents: the *spine* (the head's
-  line, always lane 0, which nothing else may use) and *heavy* rows (the head and everything it
-  reaches, drawn with `┃` via `Cell::shown`, and bold where no heavy glyph exists). Lines
-  heading for the same commit join early: a head-history line never gives way to an outside
-  one, otherwise the younger joins the older. `Reserved` counts the head-history lines open per
-  row so outside lines are placed to the right of them.
+  staircase would cut through another line). `connector` repeats until its height settles, since a
+  reach falling back to a run needs fewer lines. Lanes keep their column; the only sideways move
+  is the step a line takes to make room for a merge's source next to its target. Inputs besides
+  the parents: the *spine* (the head's line, always lane 0, which nothing else may use) and
+  *heavy* rows (the head and everything it reaches, drawn with `┃` via `Cell::shown`, and bold
+  where no heavy glyph exists). Lines heading for the same commit join early: a head-history line
+  never gives way to an outside one, otherwise the younger joins the older. `Reserved` counts the
+  head-history lines open per row so outside lines are placed to the right of them; a line that
+  joins the spine under its own row counts on that row only, and an outside line's last row (where
+  it comes in from above) does not count. A column whose line ended in a commit is free again for
+  a line leaving that commit.
 - **`app.rs`** holds UI state and key handling and does no I/O: keys set `reload` or `command`
   and `main.rs` acts on them. Two layers of state:
   - `View` (order, deleted, hidden refs, refs-only, chosen head, first-parent) changes what
