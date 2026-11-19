@@ -51,8 +51,11 @@ Data flows one way: `config::Settings` → `repo::load(path, &View)` → `App` �
   matches git when it uses a commit-graph file.
 - **`graph.rs`** lays out lanes, one `Row` per commit: the commit's line, and under it the
   connector lines where lines change column, as in `git log --graph` (`╲`/`╱` for a step to the
-  next column, `_` between two diagonals for a longer reach; commit lines have no horizontal
-  runs). Lanes keep their column; the only sideways move is the step a line takes to make room
+  next column; a longer reach is a staircase, one character sideways per line, which a line
+  passing by may begin on the commit's line beside its column; git's `_` run only where a
+  staircase would cut through another line). `connector` repeats until its height settles,
+  since a reach falling back to a run needs fewer lines. Lanes keep their column; the only
+  sideways move is the step a line takes to make room
   for a merge's source next to its target. Inputs besides the parents: the *spine* (the head's
   line, always lane 0, which nothing else may use) and *heavy* rows (the head and everything it
   reaches, drawn with `┃` via `Cell::shown`, and bold where no heavy glyph exists). Lines

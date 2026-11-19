@@ -5,10 +5,12 @@
 //! that commit's parents. Lanes never shift sideways: a lane keeps its column from the row that
 //! opens it to the row that closes it, and freed columns are reused by later lanes.
 //!
-//! As in `git log --graph`, a line changes column only between commits, on connector lines
-//! under the commit above: a step to the next column is one `╲` or `╱` in the gap between the
-//! two, and a longer reach runs along `_` from one diagonal to another, over two connector
-//! lines. A commit's line itself only holds the lanes passing by and the commit's node.
+//! As in `git log --graph`, a line changes column between commits, on connector lines under
+//! the commit above: a step to the next column is one `╲` or `╱` in the gap between the two.
+//! A longer reach is a staircase of diagonals, one character sideways per line, over as many
+//! connector lines as it takes; a line passing by may begin it on the commit's line, in the
+//! gap beside its column. Only where a staircase would cut through another line does the reach
+//! run along `_` from one diagonal to another, as git draws it.
 //!
 //! A spine can be given: a line of rows, each a parent of the one before (the layout head's
 //! line). Those always take the leftmost lane, which nothing else then uses, so that line runs
@@ -36,7 +38,7 @@ pub struct Cell {
     pub color: u8,
     /// The glyph's vertical line (or the node's row) is heavy.
     pub v_heavy: bool,
-    /// The glyph's horizontal line is heavy.
+    /// The glyph's horizontal or diagonal line is heavy.
     pub h_heavy: bool,
     pub conn: char,
     pub conn_color: u8,
@@ -175,7 +177,7 @@ pub fn layout<'a>(
                 })
                 .collect();
             edges.extend(joins.drain(..).map(|e| Edge { to: into(e.to), ..e }));
-            above.below = connector(&edges);
+            above.below = connector(&edges, &mut above.cells);
         }
 
         let mut cells = vec![BLANK; lanes.len()];
@@ -368,46 +370,60 @@ fn make_room_for_merge(
 
 /// The connector lines between two rows, for lines going from a column of the upper row to one
 /// of the lower: none when every line goes straight down, one for steps to the next column,
-/// two for longer reaches. A step's diagonal is on the first line for a line leaving the upper
+/// more for longer reaches. A step's diagonal is on the first line for a line leaving the upper
 /// commit, else on the last, next to where it arrives.
-fn connector(edges: &[Edge]) -> Vec<Vec<Cell>> {
-    let height = edges.iter().map(|e| e.from.abs_diff(e.to)).max().unwrap_or(0).min(2);
+///
+/// A longer reach is a staircase, one character sideways per line, and not git's `_` run
+/// between two diagonals. A line passing the upper commit by may begin it on that commit's own
+/// line (`above`), in the gap beside its column, which saves a connector line. Where the
+/// staircase would cut through another line, the reach falls back to the `_` run.
+fn connector(edges: &[Edge], above: &mut Vec<Cell>) -> Vec<Vec<Cell>> {
+    // Light lines first, so heavy ones win where they share a character.
+    let mut edges = edges.to_vec();
+    edges.sort_by_key(|e| e.heavy);
+    // Long reaches drawn as `_` runs, which need only two lines: those whose staircase did not
+    // fit. Fewer lines can make another staircase not fit, so this repeats until it settles.
+    let mut runs = vec![false; edges.len()];
+    loop {
+        let mut upper = above.clone();
+        let (lines, fell_back) = draw_connector(&edges, &runs, &mut upper);
+        if fell_back.iter().zip(&runs).all(|(&f, &r)| !f || r) {
+            *above = upper;
+            return lines;
+        }
+        for (r, f) in runs.iter_mut().zip(fell_back) {
+            *r |= f;
+        }
+    }
+}
+
+/// One go at the connector lines, with the long reaches marked in `runs` drawn as `_` runs.
+/// Also says which long reaches had to fall back to a run.
+fn draw_connector(edges: &[Edge], runs: &[bool], above: &mut Vec<Cell>) -> (Vec<Vec<Cell>>, Vec<bool>) {
+    let reach = |e: &Edge| e.from.abs_diff(e.to);
+    // Whether a long reach can begin on the upper commit's line: it passes by there.
+    let starts_above = |e: &Edge| !e.from_node && above.get(e.from).is_some_and(|c| c.glyph == '│');
+    let need = |(e, &run): (&Edge, &bool)| match reach(e) {
+        0 => 0,
+        1 => 1,
+        _ if run => 2,
+        r if starts_above(e) => 2 * r - 2,
+        r => 2 * r - 1,
+    };
+    let height = edges.iter().zip(runs).map(need).max().unwrap_or(0);
+    let mut fell_back = vec![false; edges.len()];
     if height == 0 {
-        return Vec::new();
+        return (Vec::new(), fell_back);
     }
     let width = edges.iter().map(|e| e.from.max(e.to) + 1).max().unwrap_or(0);
     let mut lines = vec![vec![BLANK; width]; height];
-    // Light lines first, so heavy ones win where they share a character; verticals, then
-    // runs, then diagonals, which go over runs.
-    let mut edges = edges.to_vec();
-    edges.sort_by_key(|e| e.heavy);
-    let put = |line: &mut Vec<Cell>, x: usize, ch: char, e: &Edge| {
-        let cell = &mut line[x / 2];
-        if x.is_multiple_of(2) {
-            match ch {
-                // Two lines down the same lane: a heavy one wins.
-                '│' if cell.glyph == '│' && (cell.v_heavy || !e.heavy) => {}
-                '│' => *cell = Cell { glyph: '│', color: e.color, v_heavy: e.heavy, ..*cell },
-                _ if cell.glyph == ' ' || cell.glyph == '_' => {
-                    *cell = Cell { glyph: ch, color: e.color, h_heavy: e.heavy, ..*cell }
-                }
-                _ => {}
-            }
-        } else {
-            let ch = match (cell.conn, ch) {
-                ('╱', '╲') | ('╲', '╱') | ('╳', _) => '╳',
-                ('╱' | '╲', '_') => return,
-                _ => ch,
-            };
-            *cell = Cell { conn: ch, conn_color: e.color, conn_heavy: e.heavy, ..*cell };
-        }
-    };
+    // Verticals, then steps, then long reaches.
     for e in edges.iter().filter(|e| e.from == e.to) {
         for line in &mut lines {
             put(line, 2 * e.from, '│', e);
         }
     }
-    for e in edges.iter().filter(|e| e.from.abs_diff(e.to) == 1) {
+    for e in edges.iter().filter(|e| reach(e) == 1) {
         let (a, b) = (e.from, e.to);
         let at = if e.from_node { 0 } else { height - 1 };
         for (i, line) in lines.iter_mut().enumerate() {
@@ -418,29 +434,126 @@ fn connector(edges: &[Edge]) -> Vec<Vec<Cell>> {
             }
         }
     }
-    let long: Vec<&Edge> = edges.iter().filter(|e| e.from.abs_diff(e.to) > 1).collect();
-    for e in &long {
-        let (lo, hi) = (e.from.min(e.to), e.from.max(e.to));
-        for x in 2 * lo + 2..=2 * hi - 2 {
-            put(&mut lines[0], x, '_', e);
+    for (k, e) in edges.iter().enumerate().filter(|(_, e)| reach(e) > 1) {
+        if runs[k] || !staircase(e, &mut lines, above) {
+            fell_back[k] = !runs[k];
+            run(e, &mut lines);
         }
     }
-    for e in &long {
-        let (a, b) = (e.from, e.to);
-        if b > a {
-            put(&mut lines[0], 2 * a + 1, '╲', e);
-            put(&mut lines[1], 2 * b - 1, '╲', e);
-        } else {
-            put(&mut lines[0], 2 * a - 1, '╱', e);
-            put(&mut lines[1], 2 * b + 1, '╱', e);
-        }
-    }
-    for line in &mut lines {
+    for line in lines.iter_mut().chain(std::iter::once(above)) {
         while line.last().is_some_and(|c| *c == BLANK) {
             line.pop();
         }
     }
-    lines
+    (lines, fell_back)
+}
+
+/// Draws `ch` for line `e` at character position `x` of `line` (even: a lane, odd: the gap
+/// right of one), where nothing else is drawn or where it joins what is.
+fn put(line: &mut [Cell], x: usize, ch: char, e: &Edge) {
+    let cell = &mut line[x / 2];
+    if x.is_multiple_of(2) {
+        match ch {
+            // Two lines down the same lane: a heavy one wins.
+            '│' if cell.glyph == '│' && (cell.v_heavy || !e.heavy) => {}
+            '│' => *cell = Cell { glyph: '│', color: e.color, v_heavy: e.heavy, ..*cell },
+            _ if cell.glyph == ' ' || cell.glyph == '_' => {
+                *cell = Cell { glyph: ch, color: e.color, h_heavy: e.heavy, ..*cell }
+            }
+            _ => {}
+        }
+    } else {
+        let ch = match (cell.conn, ch) {
+            ('╱', '╲') | ('╲', '╱') | ('╳', _) => '╳',
+            ('╱' | '╲', '_') => return,
+            _ => ch,
+        };
+        *cell = Cell { conn: ch, conn_color: e.color, conn_heavy: e.heavy, ..*cell };
+    }
+}
+
+/// Whether `ch` can go at position `x` of `line` without covering another line: the spot is
+/// free, or holds the same diagonal (two lines for the same commit meet there).
+fn fits(line: &[Cell], x: usize, ch: char) -> bool {
+    let Some(cell) = line.get(x / 2) else { return x / 2 >= line.len() };
+    if x.is_multiple_of(2) { cell.glyph == ' ' || cell.glyph == ch } else { cell.conn == ' ' || cell.conn == ch }
+}
+
+/// A long reach as a staircase: one diagonal character per line, going one position sideways
+/// each time. A line leaving the upper commit begins at once and then goes straight down; a
+/// line passing by goes straight down first and arrives on the last line, beginning on the
+/// upper commit's line if the connector lines are too few. False, with nothing drawn, if it
+/// would cover another line.
+fn staircase(e: &Edge, lines: &mut [Vec<Cell>], above: &mut Vec<Cell>) -> bool {
+    let (a, b, height) = (e.from, e.to, lines.len() as isize);
+    let steps = 2 * a.abs_diff(b) as isize - 1;
+    let ch = if b < a { '╱' } else { '╲' };
+    let x_at = |k: isize| (2 * a as isize + if b < a { -k } else { k }) as usize;
+    // The line index of the k-th diagonal (1-based); -1 is the upper commit's own line.
+    let first = if e.from_node { 0 } else { height - steps };
+    if first < -1 || first == -1 && !above.get(a).is_some_and(|c| c.glyph == '│') {
+        return false;
+    }
+    let line_of = |i: isize| -> Option<&Vec<Cell>> { if i < 0 { None } else { Some(&lines[i as usize]) } };
+    let diagonal_fits = (1..=steps).all(|k| {
+        let i = first + k - 1;
+        match line_of(i) {
+            Some(line) => fits(line, x_at(k), ch),
+            None => fits(above, x_at(k), ch),
+        }
+    });
+    let straight: Vec<(usize, usize)> = (0..height as usize)
+        .filter(|&i| (i as isize) < first || (i as isize) > first + steps - 1)
+        .map(|i| (i, if (i as isize) < first { a } else { b }))
+        .collect();
+    let straight_fits = straight.iter().all(|&(i, col)| fits(&lines[i], 2 * col, '│'));
+    if !diagonal_fits || !straight_fits {
+        return false;
+    }
+    for &(i, col) in &straight {
+        put(&mut lines[i], 2 * col, '│', e);
+    }
+    for k in 1..=steps {
+        let i = first + k - 1;
+        let x = x_at(k);
+        if i < 0 {
+            // It leaves its column on the commit's line: the column is empty there now.
+            above[a].glyph = ' ';
+            while above.len() <= x / 2 {
+                above.push(BLANK);
+            }
+            put(above, x, ch, e);
+        } else {
+            put(&mut lines[i as usize], x, ch, e);
+        }
+    }
+    true
+}
+
+/// A long reach as git draws it: along `_` from a diagonal at one end to a diagonal on the next
+/// line at the other, on the first two connector lines for a line leaving the upper commit,
+/// else on the last two; straight down on any others.
+fn run(e: &Edge, lines: &mut [Vec<Cell>]) {
+    let (a, b) = (e.from, e.to);
+    let (lo, hi) = (a.min(b), a.max(b));
+    let top = if e.from_node { 0 } else { lines.len() - 2 };
+    for (i, line) in lines.iter_mut().enumerate() {
+        if i < top {
+            put(line, 2 * a, '│', e);
+        } else if i > top + 1 {
+            put(line, 2 * b, '│', e);
+        }
+    }
+    for x in 2 * lo + 2..=2 * hi - 2 {
+        put(&mut lines[top], x, '_', e);
+    }
+    if b > a {
+        put(&mut lines[top], 2 * a + 1, '╲', e);
+        put(&mut lines[top + 1], 2 * b - 1, '╲', e);
+    } else {
+        put(&mut lines[top], 2 * a - 1, '╱', e);
+        put(&mut lines[top + 1], 2 * b + 1, '╱', e);
+    }
 }
 
 #[cfg(test)]
@@ -588,7 +701,7 @@ mod tests {
             render(parents, &spine),
             [
                 "●", "│╲", "│ ●", "│ ●", "│  ╲", "●   │", "│╲  │", "│ ● │", "│ ● │", "│ ● │", "│  ╲│",
-                "●   │", "●   │", "│╲  │", "│ ● │", "│ ● │", "│  ╲│", "●   │", "│ _╱", "│╱", "●",
+                "●   │", "●   │", "│╲  │", "│ ● │", "│ ● │", "│  ╲│", "●  ╱", "│ ╱", "│╱", "●",
             ]
         );
     }
@@ -602,13 +715,13 @@ mod tests {
         // Unmarked, the tip takes column 1 and has to step aside for the merge.
         assert_eq!(
             render(parents, &spine),
-            ["  ●", "   ╲", "●   │", "│╲  │", "│ ● │", "│╱  │", "●   │", "│ _╱", "│╱", "●"]
+            ["  ●", "   ╲", "●   │", "│╲  │", "│ ● │", "│╱  │", "●  ╱", "│ ╱", "│╱", "●"]
         );
         // With the head's history marked, the tip starts right of the column it needs.
         let heavy = [false, true, true, true, true];
         assert_eq!(
             render_heavy(parents, &spine, &heavy),
-            ["    ●", "●   │", "┃╲  │", "┃ ● │", "┃╱  │", "●   │", "┃ _╱", "┃╱", "●"]
+            ["    ●", "●   │", "┃╲  │", "┃ ● │", "┃╱  │", "●  ╱", "┃ ╱", "┃╱", "●"]
         );
     }
 
@@ -630,9 +743,23 @@ mod tests {
     }
 
     #[test]
+    fn long_reaches_are_staircases() {
+        // The head 1 merges 3 (spine) and 2; the tip 0 passes by in column 2 and heads for 3
+        // too. Its line leaves column 2 on 2's own line, beside the commit, and goes down one
+        // step per line, never along `_`.
+        let heavy = [false, true, true, true];
+        let got = render_heavy(&[&[3], &[3, 2], &[3], &[]], &[1, 3], &heavy);
+        assert_eq!(got, ["    ●", "●   │", "┃╲  │", "┃ ●╱", "┃╱╱", "┃╱", "●"]);
+        // Three columns: more connector lines.
+        let heavy = [false, true, true, true, true];
+        let got = render_heavy(&[&[4], &[4, 2], &[4], &[4], &[]], &[1, 4], &heavy);
+        assert_eq!(got[5..], ["┃ ●  ╱", "┃╱  ╱", "┃  ╱", "┃ ╱", "┃╱", "●"]);
+    }
+
+    #[test]
     fn run_over_freed_lane() {
         // Lane 2's long reach into 4 passes column 1, freed when 2 joined lane 0.
         let got = render(&[&[3], &[2, 4], &[3], &[4], &[]], &[]);
-        assert_eq!(got, ["●", "│ ●", "│ │╲", "│ ● │", "│╱  │", "●   │", "│ _╱", "│╱", "●"]);
+        assert_eq!(got, ["●", "│ ●", "│ │╲", "│ ● │", "│╱  │", "●  ╱", "│ ╱", "│╱", "●"]);
     }
 }
